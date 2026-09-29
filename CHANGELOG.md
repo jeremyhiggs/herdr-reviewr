@@ -8,8 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 - **Changed files can be marked reviewed with `x`.** A green `✓` records the exact diff for the
-  current scope, base, or commit pick. Marks are session-only and clear automatically when that
-  comparison changes.
+  current scope, base, or commit pick. If the file changes later, an orange `!` keeps the earlier
+  review visible until `x` accepts the new diff; press `x` again to clear it. Review state is
+  session-only and isolated between comparisons.
 
 ## [0.39.0] — 2026-09-23
 
