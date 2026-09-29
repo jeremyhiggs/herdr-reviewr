@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Changed files can be marked reviewed with `x`.** A green `✓` records the exact diff for the
+  current scope, base, or commit pick. Marks are session-only and clear automatically when that
+  comparison changes.
+
 ## [0.39.0] — 2026-09-23
 
 ### Added
