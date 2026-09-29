@@ -4490,6 +4490,161 @@ fn a_result_for_a_view_that_moved_on_is_discarded_whole() {
 }
 
 #[test]
+fn reviewed_files_prune_by_exact_identity_without_resurrection() {
+    let r = Repo::init();
+    r.write("a.rs", "base a\n");
+    r.write("b.rs", "base b\n");
+    r.commit_all("init");
+    r.write("a.rs", "reviewed a\n");
+    r.write("b.rs", "reviewed b\n");
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+    assert!(app.set_file_reviewed("b.rs", true));
+
+    r.write("a.rs", "changed again\n");
+    let changed = completion_for(&app, 1);
+    assert!(herdr_reviewr::land_world_completion(&mut app, changed, 1));
+    assert!(!app.file_reviewed("a.rs"), "AE3: only the changed file loses review");
+    assert!(app.file_reviewed("b.rs"), "AE3: an unchanged sibling keeps review");
+
+    r.write("a.rs", "reviewed a\n");
+    app.reconcile_world(herdr_reviewr::world::build(&app.world_input()).unwrap());
+    assert!(!app.file_reviewed("a.rs"), "AE4: restoring old bytes cannot resurrect review");
+
+    r.write("b.rs", "base b\n");
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("b.rs"), "a disappeared path is pruned");
+    r.write("b.rs", "reviewed b\n");
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("b.rs"), "a reintroduced path starts unreviewed");
+}
+
+#[test]
+fn reviewed_files_are_isolated_by_context_and_pruned_on_sync_return() {
+    let r = Repo::init();
+    r.write("a.rs", "base\n");
+    r.commit_all("base");
+    r.git(&["checkout", "-q", "-b", "feature"]);
+    r.write("a.rs", "committed feature\n");
+    r.commit_all("feature");
+    r.write("a.rs", "dirty\n");
+    let mut app = App::new(r.path_buf(), Scope::Uncommitted, Some("main".to_string()));
+    app.reload().unwrap();
+
+    assert!(app.set_file_reviewed("a.rs", true));
+    app.set_scope(Scope::Branch).unwrap();
+    assert!(!app.file_reviewed("a.rs"), "AE5: branch has an independent review namespace");
+    assert!(app.set_file_reviewed("a.rs", true));
+    app.set_scope(Scope::Uncommitted).unwrap();
+    assert!(app.file_reviewed("a.rs"), "AE5: unchanged uncommitted review returns");
+
+    app.set_scope(Scope::Branch).unwrap();
+    r.write("a.rs", "dirty after review\n");
+    app.set_scope(Scope::Uncommitted).unwrap();
+    assert!(!app.file_reviewed("a.rs"), "a synchronous landing applies the same pruning rule");
+}
+
+#[test]
+fn reviewed_files_are_isolated_between_selected_bases() {
+    let r = based_repo();
+    let mut app = App::new(r.path_buf(), Scope::Branch, None);
+    app.reload().unwrap();
+    assert_eq!(
+        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
+        Some("main")
+    );
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    herdr_reviewr::git::write_base_pick(r.path(), "dev").unwrap();
+    app.reload().unwrap();
+    assert_eq!(
+        app.branch_base.winner.as_ref().map(herdr_reviewr::git::ResolvedBase::name),
+        Some("dev")
+    );
+    assert!(!app.file_reviewed("a.rs"), "a selected base owns its own review namespace");
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    herdr_reviewr::git::write_base_pick(r.path(), "main").unwrap();
+    app.reload().unwrap();
+    assert!(app.file_reviewed("a.rs"), "returning to an unchanged base restores its review");
+}
+
+#[test]
+fn all_files_scope_rebuild_uses_the_same_review_pruning_boundary() {
+    use herdr_reviewr::app::Tab;
+
+    let r = Repo::init();
+    r.write("a.rs", "base\n");
+    r.commit_all("base");
+    r.git(&["checkout", "-q", "-b", "feature"]);
+    r.write("a.rs", "feature\n");
+    r.commit_all("feature");
+    r.write("a.rs", "dirty\n");
+    let mut app = App::new(r.path_buf(), Scope::Uncommitted, Some("main".to_string()));
+    app.reload().unwrap();
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    enter_tab(&mut app, Tab::AllFiles);
+    app.set_scope(Scope::Branch).unwrap();
+    r.write("a.rs", "dirty after review\n");
+    app.set_scope(Scope::Uncommitted).unwrap();
+    assert!(
+        !app.file_reviewed("a.rs"),
+        "the changed-only All Files rebuild prunes like a full world landing"
+    );
+}
+
+#[test]
+fn stale_and_failed_world_results_do_not_touch_reviewed_state() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    let mut stale = completion_for(&app, 4);
+    stale.input.scope = Scope::Branch;
+    assert!(herdr_reviewr::land_world_completion(&mut app, stale, 4));
+    assert!(app.file_reviewed("a.rs"), "a rejected input cannot prune review state");
+
+    let failed = herdr_reviewr::world::WorldCompletion {
+        generation: 5,
+        input: app.world_input(),
+        reveal: false,
+        turn: None,
+        snapshot: Some(Err(anyhow::anyhow!("identity build failed"))),
+    };
+    assert!(herdr_reviewr::land_world_completion(&mut app, failed, 5));
+    assert!(app.file_reviewed("a.rs"), "a failed build cannot prune review state");
+}
+
+#[test]
+fn a_failed_scope_rebuild_is_transactional_including_reviewed_state() {
+    let r = Repo::init();
+    r.write("a.rs", "base\n");
+    r.commit_all("base");
+    r.write("a.rs", "dirty\n");
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+    let before_entries = app.entries.clone();
+    let before_diff = app.diff.clone();
+    let before_path = app.diff_path.clone();
+    let index = r.path().join(".git/index");
+    let saved_index = std::fs::read(&index).unwrap();
+    std::fs::write(&index, b"not a git index").unwrap();
+
+    let result = app.set_scope(Scope::Branch);
+    std::fs::write(&index, saved_index).unwrap();
+    assert!(result.is_err(), "the missing commit object fails the prospective build");
+    assert_eq!(app.scope, Scope::Uncommitted, "scope changes only after a successful build");
+    assert_eq!(app.entries, before_entries, "the navigator stays on the prior snapshot");
+    assert_eq!(app.diff, before_diff, "the loaded diff stays on the prior snapshot");
+    assert_eq!(app.diff_path, before_path);
+    assert!(app.file_reviewed("a.rs"), "authored review state is untouched on failure");
+
+    let fresh = app_on(&r);
+    assert!(!fresh.file_reviewed("a.rs"), "a new session starts with no review marks");
+}
+
+#[test]
 fn a_superseded_completion_syncs_the_baseline_but_paints_nothing() {
     let r = edited_repo();
     let mut app = app_on(&r);
@@ -5746,6 +5901,31 @@ fn a_pick_retags_the_world_input() {
     app.input_push('d');
     app.base_picker_pick().unwrap();
     assert_ne!(app.world_input(), stale, "an in-flight build's tag no longer matches");
+}
+
+#[test]
+fn a_failed_base_pick_build_leaves_the_picker_and_visible_review_state_whole() {
+    let r = based_repo();
+    r.write("a.rs", "dirty\n");
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+    app.open_base_picker();
+    goto_row(&mut app, "dev");
+    let before_entries = app.entries.clone();
+    let before_diff = app.diff.clone();
+    let index = r.path().join(".git/index");
+    let saved_index = std::fs::read(&index).unwrap();
+    std::fs::write(&index, b"not a git index").unwrap();
+
+    let result = app.base_picker_pick();
+    std::fs::write(&index, saved_index).unwrap();
+    assert!(result.is_err());
+    assert_eq!(app.mode, Mode::BasePick, "a failed prospective build keeps the picker open");
+    assert_eq!(app.scope, Scope::Uncommitted);
+    assert_eq!(herdr_reviewr::git::read_base_pick(r.path()).unwrap(), None);
+    assert_eq!(app.entries, before_entries);
+    assert_eq!(app.diff, before_diff);
+    assert!(app.file_reviewed("a.rs"));
 }
 
 #[test]
@@ -7204,6 +7384,31 @@ fn enter_picks_the_highlight_and_switches_to_the_commits_scope() {
     app.set_scope(Scope::LastTurn).unwrap();
     app.set_scope(app.scope.cycle()).unwrap();
     assert_eq!(app.scope, Scope::Commits);
+}
+
+#[test]
+fn a_failed_commit_pick_build_leaves_the_picker_and_visible_review_state_whole() {
+    let (r, shas) = commits_repo();
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("root.rs", true));
+    app.open_commit_picker();
+    let before_entries = app.entries.clone();
+    let before_diff = app.diff.clone();
+    let tree = r.git(&["rev-parse", &format!("{}^{{tree}}", shas[3])]);
+    let tree = tree.trim();
+    let object = r.path().join(".git/objects").join(&tree[..2]).join(&tree[2..]);
+    let hidden = object.with_extension("reviewr-test-hidden");
+    std::fs::rename(&object, &hidden).unwrap();
+
+    let result = app.commit_picker_pick();
+    std::fs::rename(&hidden, &object).unwrap();
+    assert!(result.is_err());
+    assert_eq!(app.mode, Mode::CommitPick, "a failed prospective build keeps the picker open");
+    assert_eq!(app.scope, Scope::Uncommitted);
+    assert_eq!(app.commit_pick, None);
+    assert_eq!(app.entries, before_entries);
+    assert_eq!(app.diff, before_diff);
+    assert!(app.file_reviewed("root.rs"));
 }
 
 #[test]

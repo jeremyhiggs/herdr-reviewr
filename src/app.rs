@@ -19,7 +19,9 @@ use crate::git;
 use crate::herdr::{self, AgentChoice, SendTarget};
 use crate::highlight::Highlighter;
 use crate::logln;
-use crate::model::{Comment, CommentStore, CommitPick, Rev, Scope, Side};
+use crate::model::{
+    Comment, CommentStore, CommitPick, FileIdentity, Rev, ReviewContext, Scope, Side,
+};
 use crate::theme::{self, Palette};
 use crate::world::{PickStatus, PickVerdict};
 
@@ -690,6 +692,13 @@ pub struct App {
     /// annotate `All files` entries with their marker and stats. Stays correct while `All
     /// files` lists the whole worktree.
     changed: HashMap<String, Annotation>,
+    /// The semantic namespace that produced `changed`. It lands atomically with the
+    /// changeset and is never stashed per tab: scopes and explicit selections own review
+    /// decisions, while tabs are only two views over the same active comparison.
+    review_context: Option<ReviewContext>,
+    /// Human-authored, session-only file review decisions. A value is the exact comparison
+    /// the reviewer accepted, so a successful landing can permanently discard stale marks.
+    reviewed: HashMap<ReviewContext, HashMap<String, FileIdentity>>,
     pub diff: FileDiff,
     /// The rows actually shown: `diff.rows` with each fold collapsed to a marker or
     /// expanded to its lines. The cursor, scroll, selection, and hit-testing index this.
@@ -897,6 +906,13 @@ enum PluginConfigState {
     Blocked { error: String },
 }
 
+/// A synchronous scope/base/pick rebuild prepared entirely against prospective selection
+/// state. Nothing in `App` changes until one of these complete builds exists.
+enum RebaseBuild {
+    World(crate::world::WorldSnapshot),
+    Changes(crate::world::ScopeBuild),
+}
+
 impl App {
     pub fn new(repo: PathBuf, scope: Scope, base: Option<String>) -> Self {
         Self::build(repo, scope, base, true)
@@ -936,6 +952,8 @@ impl App {
             toggled_dirs: HashSet::new(),
             stash: TabStash::default(),
             changed: HashMap::new(),
+            review_context: None,
+            reviewed: HashMap::new(),
             diff: FileDiff::empty(),
             visible: Vec::new(),
             expanded_folds: HashSet::new(),
@@ -1117,6 +1135,14 @@ impl App {
         self.last_sent_pane = old.last_sent_pane.take();
         // The commit pick is session memory like the comments: replaced, never cleared
         self.commit_pick = old.commit_pick.take();
+        // Review decisions are authored session state too. The replacement app has already
+        // loaded one fresh context; reconcile the transferred map against that successful
+        // snapshot before any recovered frame can paint.
+        self.reviewed = std::mem::take(&mut old.reviewed);
+        if let Some(context) = self.review_context.clone() {
+            let changed = self.changed.clone();
+            self.prune_reviewed(&context, &changed);
+        }
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
         self.navigator_hidden = old.navigator_hidden;
@@ -1148,6 +1174,7 @@ impl App {
                 self.reveal_files = old.reveal_files;
                 self.reveal_diff = old.reveal_diff;
                 self.changed = std::mem::take(&mut old.changed);
+                self.review_context = old.review_context.take();
                 // The header's base label describes the carried list, so it carries too —
                 // a fresh app would paint `no base` beside a populated frame
                 self.branch_base = std::mem::take(&mut old.branch_base);
@@ -1291,21 +1318,6 @@ impl App {
         if !self.tab.is_file_tab() {
             return Ok(());
         }
-        // Outside a git repo, show an empty state rather than failing.
-        if !git::is_repo(&self.repo) {
-            self.entries.clear();
-            self.changed.clear();
-            self.file_rows.clear();
-            self.file_cursor = 0;
-            self.file_scroll = 0;
-            if !self.composing() {
-                self.diff = FileDiff::empty();
-                self.diff_path = None;
-                self.visible.clear(); // keep `visible` mirroring `diff` so no stale rows paint
-                self.reset_diff_view();
-            }
-            return Ok(());
-        }
         let snapshot = crate::world::build(&self.world_input())?;
         self.reconcile_world(snapshot);
         Ok(())
@@ -1350,6 +1362,33 @@ impl App {
         }
     }
 
+    /// Adopt one complete scope build. This is the sole successful-landing boundary for the
+    /// active changeset, its semantic review namespace, the header metadata, and reviewed-mark
+    /// invalidation. Callers must set prospective selection state before calling it.
+    fn adopt_changeset(
+        &mut self,
+        review_context: ReviewContext,
+        changed: HashMap<String, Annotation>,
+        branch_base: git::BaseStatus,
+        pick_status: Option<PickStatus>,
+    ) {
+        self.prune_reviewed(&review_context, &changed);
+        self.review_context = Some(review_context);
+        self.changed = changed;
+        self.adopt_branch_base(branch_base);
+        self.adopt_pick_status(pick_status);
+    }
+
+    /// Permanently remove decisions invalidated by a successful snapshot in this context.
+    /// Other contexts are deliberately untouched, and removed values are never reconstructed
+    /// from identity history, so restoring old bytes cannot resurrect a review decision.
+    fn prune_reviewed(&mut self, context: &ReviewContext, changed: &HashMap<String, Annotation>) {
+        let Some(reviewed) = self.reviewed.get_mut(context) else { return };
+        reviewed.retain(|path, identity| {
+            changed.get(path).is_some_and(|annotation| annotation.identity == *identity)
+        });
+    }
+
     /// Reconcile a built snapshot into the view — the one place a world result touches place
     /// state, by identity first, then fallback, then clamp (Continuity).
     /// A navigator drag never reaches here: it gates the world drain itself, so the snapshot
@@ -1371,10 +1410,13 @@ impl App {
         // file, then the first file. The toggled-directory set survives untouched.
         let anchor = self.cursor_anchor();
         let open = self.diff_path.clone();
-        self.changed = snapshot.changed;
+        self.adopt_changeset(
+            snapshot.review_context,
+            snapshot.changed,
+            snapshot.branch_base,
+            snapshot.pick_status,
+        );
         self.entries = snapshot.entries;
-        self.adopt_branch_base(snapshot.branch_base);
-        self.adopt_pick_status(snapshot.pick_status);
         self.rebuild_file_rows();
         self.file_cursor = anchor
             .and_then(|a| self.row_of_anchor(&a))
@@ -2400,8 +2442,11 @@ impl App {
             return Ok(());
         }
         if self.scope != scope && !self.composing() {
+            let mut input = self.world_input();
+            input.scope = scope;
+            let build = self.build_rebase(&input)?;
             self.scope = scope;
-            self.rebase_changes()?;
+            self.adopt_rebase(build);
             // An explicit switch reveals the cursor (a poll does not).
             self.reveal_files = true;
         }
@@ -2415,40 +2460,50 @@ impl App {
     /// move), so its own state is held by `reload`. The Changes state is the active one on
     /// `Changes` and the stashed one while `All files` is shown — reset whichever holds it,
     /// so a return to Changes never lands on a stale scroll or a pre-expanded fold.
-    fn rebase_changes(&mut self) -> Result<()> {
-        self.cache = DiffCache::new();
+    fn build_rebase(&self, input: &crate::world::WorldInput) -> Result<RebaseBuild> {
         if self.tab == Tab::Changes {
-            self.file_cursor = 0;
-            self.expanded_folds.clear();
-            self.reset_diff_view();
-            // The changed set rebuilds before the frame, so the list never shows another
-            // base's files under the new base's label. In `Changes` the
-            // changeset is the whole snapshot, so this is the full (cheap) reload.
-            self.reload()?;
+            crate::world::build(input).map(RebaseBuild::World)
         } else {
-            self.stash.file_cursor = 0;
-            self.stash.expanded_folds.clear();
-            self.stash.diff_cursor = 0;
-            self.stash.diff_scroll = 0;
-            self.stash.h_scroll = 0;
-            self.stash.select_anchor = None;
-            // `All files` keeps its tree; only the changed set rebuilds before the frame.
-            // The tree's annotations refresh behind it via the worker.
-            let build = crate::world::build_changed(&self.world_input())?;
-            self.adopt_branch_base(build.branch_base);
-            self.adopt_pick_status(build.pick_status);
-            self.changed = crate::world::annotate(&build.changed);
-            // Re-mark the tree in place — the rows are base-independent, only their
-            // badges move, so the switch frame never shows the old base's badges
-            // under the new base's header (policies/ux-responsiveness.md). The tree
-            // itself still refreshes behind the switch.
-            for entry in &mut self.entries {
-                entry.annotation = self.changed.get(&entry.path).cloned();
-            }
-            self.rebuild_file_rows();
-            self.request_world_refresh(false, false);
+            crate::world::build_changed(input).map(RebaseBuild::Changes)
         }
-        Ok(())
+    }
+
+    /// Apply a build prepared by [`Self::build_rebase`]. Selection state must already name
+    /// the prospective input; every operation from here is infallible, so the scope/base/pick,
+    /// headers, list, diff, and review pruning become visible as one transaction.
+    fn adopt_rebase(&mut self, build: RebaseBuild) {
+        self.cache = DiffCache::new();
+        match build {
+            RebaseBuild::World(snapshot) => {
+                self.file_cursor = 0;
+                self.expanded_folds.clear();
+                self.reset_diff_view();
+                // The changed set rebuilds before the frame, so the list never shows another
+                // base's files under the new base's label.
+                self.reconcile_world(snapshot);
+            }
+            RebaseBuild::Changes(build) => {
+                self.stash.file_cursor = 0;
+                self.stash.expanded_folds.clear();
+                self.stash.diff_cursor = 0;
+                self.stash.diff_scroll = 0;
+                self.stash.h_scroll = 0;
+                self.stash.select_anchor = None;
+                // `All files` keeps its tree; only the changed set and annotations switch.
+                let changed = crate::world::annotate(&build.changed);
+                self.adopt_changeset(
+                    build.review_context,
+                    changed,
+                    build.branch_base,
+                    build.pick_status,
+                );
+                for entry in &mut self.entries {
+                    entry.annotation = self.changed.get(&entry.path).cloned();
+                }
+                self.rebuild_file_rows();
+                self.request_world_refresh(false, false);
+            }
+        }
     }
 
     /// Queue a PR refresh, merging into any request already pending: the stronger kind
@@ -3948,6 +4003,38 @@ impl App {
         self.changed.get(path)
     }
 
+    /// Whether `path` is reviewed in the active semantic comparison, for navigator rendering
+    /// and contextual actions. An identity mismatch is never reported as reviewed even before
+    /// the next successful snapshot gets a chance to prune it.
+    pub fn file_reviewed(&self, path: &str) -> bool {
+        let Some(context) = self.review_context.as_ref() else { return false };
+        let Some(identity) = self.changed.get(path).map(|a| &a.identity) else { return false };
+        self.reviewed
+            .get(context)
+            .and_then(|reviewed| reviewed.get(path))
+            .is_some_and(|reviewed| reviewed == identity)
+    }
+
+    /// Set the human review decision for one path in the active comparison. Target and
+    /// displayed-diff eligibility are owned by the interaction layer; this state operation
+    /// accepts only a path in the landed changeset and always stores that row's exact identity.
+    /// Returns whether authored state changed.
+    pub fn set_file_reviewed(&mut self, path: &str, reviewed: bool) -> bool {
+        let Some(context) = self.review_context.clone() else { return false };
+        if reviewed {
+            let Some(identity) = self.changed.get(path).map(|a| a.identity.clone()) else {
+                return false;
+            };
+            let paths = self.reviewed.entry(context).or_default();
+            if paths.get(path) == Some(&identity) {
+                return false;
+            }
+            paths.insert(path.to_string(), identity);
+            return true;
+        }
+        self.reviewed.get_mut(&context).and_then(|paths| paths.remove(path)).is_some()
+    }
+
     /// `/`: open the search screen, from any tab, from either pane.
     pub fn open_search(&mut self) {
         // A navigator-divider drag held from the review view must not become a search-split
@@ -4748,19 +4835,27 @@ impl App {
             bp.visible().get(bp.cursor).map(|c| (*c).clone())
         };
         let Some(choice) = choice else { return Ok(()) };
-        self.close_base_picker();
+        // Build against the chosen spelling before either the private ref or visible state
+        // moves. `base` is only the prospective build override here; after the ref write,
+        // ordinary inputs resolve the same choice from the repository-owned pick.
+        let mut input = self.world_input();
+        input.scope = Scope::Branch;
+        input.base = Some(choice.name().to_string());
+        input.base_epoch = input.base_epoch.wrapping_add(1);
+        let build = self.build_rebase(&input)?;
         let write = git::write_base_pick(&self.repo, choice.name());
         if let Err(e) = write {
             self.status = e.0;
             return Ok(());
         }
+        self.close_base_picker();
         // Epoch first: any build still in flight read the old pick, and the bump makes its
         // landing fail the input match instead of reverting this one
         // (`crate::world::WorldInput`).
         self.base_epoch = self.base_epoch.wrapping_add(1);
         // A pick takes the reviewer to the scope it configures, like the commit picker
         self.scope = Scope::Branch;
-        self.rebase_changes()?;
+        self.adopt_rebase(build);
         self.reveal_files = true;
         Ok(())
     }
@@ -4869,6 +4964,10 @@ impl App {
         let Some(pick) = self.commit_picker.as_ref().and_then(CommitPicker::picked) else {
             return Ok(());
         };
+        let mut input = self.world_input();
+        input.scope = Scope::Commits;
+        input.commit_pick = Some(pick.clone());
+        let build = self.build_rebase(&input)?;
         self.close_commit_picker();
         self.commit_pick = Some(pick);
         // The old status describes the old shas: until the build lands the header paints
@@ -4877,7 +4976,7 @@ impl App {
         // A re-pick in the scope and a switch into it rebuild the same way: the pick is part
         // of the world input, so an in-flight build for the old pick fails the landing gate.
         self.scope = Scope::Commits;
-        self.rebase_changes()?;
+        self.adopt_rebase(build);
         self.reveal_files = true;
         Ok(())
     }
@@ -5244,6 +5343,53 @@ mod tests {
         assert_eq!(recovered.last_sent_pane.as_deref(), Some("w8:p2"));
         // A picker that was open when the config broke does not come back with it.
         assert_eq!(recovered.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn config_recovery_carries_reviews_then_prunes_against_the_loaded_context() {
+        let context = crate::model::ReviewContext::Uncommitted;
+        let identity = |new_content| {
+            crate::model::FileIdentity::from_git(crate::model::FileIdentityInput {
+                old_endpoint: "old",
+                new_endpoint: "worktree",
+                kind: crate::model::ChangeKind::Modified,
+                path: "fixture.rs",
+                previous_path: None,
+                old_mode: "100644",
+                new_mode: "100644",
+                old_content: "old-content",
+                new_content,
+                binary: false,
+                live_new_side: true,
+            })
+        };
+        let annotation = |identity| crate::file_list::Annotation {
+            change: crate::model::ChangeKind::Modified,
+            additions: 1,
+            deletions: 1,
+            binary: false,
+            identity,
+        };
+        let mut old = App::blocked(PathBuf::from("."), Scope::Uncommitted, None);
+        old.review_context = Some(context.clone());
+        old.changed.insert("kept.rs".to_string(), annotation(identity("kept")));
+        old.changed.insert("changed.rs".to_string(), annotation(identity("reviewed")));
+        old.changed.insert("gone.rs".to_string(), annotation(identity("gone")));
+        assert!(old.set_file_reviewed("kept.rs", true));
+        assert!(old.set_file_reviewed("changed.rs", true));
+        assert!(old.set_file_reviewed("gone.rs", true));
+
+        // Recovery has already loaded a fresh snapshot before authored state transfers. Only
+        // the still-present exact identity survives that successful context.
+        let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
+        recovered.review_context = Some(context);
+        recovered.changed.insert("kept.rs".to_string(), annotation(identity("kept")));
+        recovered.changed.insert("changed.rs".to_string(), annotation(identity("new")));
+        recovered.carry_authored_state_from(&mut old);
+
+        assert!(recovered.file_reviewed("kept.rs"), "an exact review survives recovery");
+        assert!(!recovered.file_reviewed("changed.rs"), "a changed identity is pruned");
+        assert!(!recovered.file_reviewed("gone.rs"), "the recovered loaded context prunes it");
     }
 
     #[test]
