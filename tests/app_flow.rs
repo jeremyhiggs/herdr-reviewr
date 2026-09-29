@@ -9,7 +9,7 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 use common::{Repo, app_on, enter_tab, typed};
-use herdr_reviewr::app::{App, Band, Focus, FooterAction, Mode};
+use herdr_reviewr::app::{App, Band, FileReviewState, Focus, FooterAction, Mode};
 use herdr_reviewr::config::NavigatorPosition;
 use herdr_reviewr::export::ExportTarget;
 use herdr_reviewr::herdr::{AgentChoice, AgentSample};
@@ -4610,7 +4610,7 @@ fn a_result_for_a_view_that_moved_on_is_discarded_whole() {
 }
 
 #[test]
-fn reviewed_files_prune_by_exact_identity_without_resurrection() {
+fn reviewed_files_become_changed_without_resurrection() {
     let r = Repo::init();
     r.write("a.rs", "base a\n");
     r.write("b.rs", "base b\n");
@@ -4624,19 +4624,44 @@ fn reviewed_files_prune_by_exact_identity_without_resurrection() {
     r.write("a.rs", "changed again\n");
     let changed = completion_for(&app, 1);
     assert!(herdr_reviewr::land_world_completion(&mut app, changed, 1));
-    assert!(!app.file_reviewed("a.rs"), "AE3: only the changed file loses review");
-    assert!(app.file_reviewed("b.rs"), "AE3: an unchanged sibling keeps review");
+    assert_eq!(
+        app.file_review_state("a.rs"),
+        FileReviewState::ReviewedButChanged,
+        "only the edited file becomes reviewed-but-changed",
+    );
+    assert_eq!(
+        app.file_review_state("b.rs"),
+        FileReviewState::Reviewed,
+        "an unchanged sibling stays reviewed",
+    );
 
     r.write("a.rs", "reviewed a\n");
     app.reconcile_world(herdr_reviewr::world::build(&app.world_input()).unwrap());
-    assert!(!app.file_reviewed("a.rs"), "AE4: restoring old bytes cannot resurrect review");
+    assert_eq!(
+        app.file_review_state("a.rs"),
+        FileReviewState::ReviewedButChanged,
+        "restoring old bytes cannot silently accept the file again",
+    );
+
+    app.toggle_current_file_reviewed();
+    assert_eq!(app.file_review_state("a.rs"), FileReviewState::Reviewed);
+    app.toggle_current_file_reviewed();
+    assert_eq!(app.file_review_state("a.rs"), FileReviewState::Unreviewed);
 
     r.write("b.rs", "base b\n");
     app.reload().unwrap();
-    assert!(!app.file_reviewed("b.rs"), "a disappeared path is pruned");
+    assert_eq!(
+        app.file_review_state("b.rs"),
+        FileReviewState::Unreviewed,
+        "a disappeared path is pruned",
+    );
     r.write("b.rs", "reviewed b\n");
     app.reload().unwrap();
-    assert!(!app.file_reviewed("b.rs"), "a reintroduced path starts unreviewed");
+    assert_eq!(
+        app.file_review_state("b.rs"),
+        FileReviewState::Unreviewed,
+        "a reintroduced path starts unreviewed",
+    );
 }
 
 fn has_review_action(app: &App) -> bool {
@@ -4803,7 +4828,7 @@ fn rebound_toggle_reviewed_dispatches_and_supplies_the_footer_key() {
 }
 
 #[test]
-fn reviewed_files_are_isolated_by_context_and_pruned_on_sync_return() {
+fn reviewed_files_are_isolated_by_context_and_marked_changed_on_sync_return() {
     let r = Repo::init();
     r.write("a.rs", "base\n");
     r.commit_all("base");
@@ -4824,7 +4849,11 @@ fn reviewed_files_are_isolated_by_context_and_pruned_on_sync_return() {
     app.set_scope(Scope::Branch).unwrap();
     r.write("a.rs", "dirty after review\n");
     app.set_scope(Scope::Uncommitted).unwrap();
-    assert!(!app.file_reviewed("a.rs"), "a synchronous landing applies the same pruning rule");
+    assert_eq!(
+        app.file_review_state("a.rs"),
+        FileReviewState::ReviewedButChanged,
+        "a synchronous landing applies the same changed-state rule",
+    );
 }
 
 #[test]
@@ -4878,14 +4907,18 @@ fn reviewed_files_are_isolated_between_last_turn_baselines() {
 
     r.write("a.rs", "changed after review\n");
     app.reload().unwrap();
-    assert!(!app.file_reviewed("a.rs"), "the active baseline prunes a changed comparison");
+    assert_eq!(app.file_review_state("a.rs"), FileReviewState::ReviewedButChanged);
     r.write("a.rs", "current\n");
     app.reload().unwrap();
-    assert!(!app.file_reviewed("a.rs"), "restoring bytes cannot resurrect a pruned review");
+    assert_eq!(
+        app.file_review_state("a.rs"),
+        FileReviewState::ReviewedButChanged,
+        "restoring bytes cannot silently accept a changed review",
+    );
 
     app.sync_turn_baseline(Some(second));
     app.reload().unwrap();
-    assert!(app.file_reviewed("a.rs"), "an inactive baseline survives another context's prune");
+    assert!(app.file_reviewed("a.rs"), "an inactive baseline survives another context's change");
 }
 
 #[test]
@@ -4926,7 +4959,7 @@ fn reviewed_files_are_isolated_between_commit_picks() {
 }
 
 #[test]
-fn all_files_scope_rebuild_uses_the_same_review_pruning_boundary() {
+fn all_files_scope_rebuild_uses_the_same_review_reconciliation_boundary() {
     use herdr_reviewr::app::Tab;
 
     let r = Repo::init();
@@ -4944,9 +4977,10 @@ fn all_files_scope_rebuild_uses_the_same_review_pruning_boundary() {
     app.set_scope(Scope::Branch).unwrap();
     r.write("a.rs", "dirty after review\n");
     app.set_scope(Scope::Uncommitted).unwrap();
-    assert!(
-        !app.file_reviewed("a.rs"),
-        "the changed-only All Files rebuild prunes like a full world landing"
+    assert_eq!(
+        app.file_review_state("a.rs"),
+        FileReviewState::ReviewedButChanged,
+        "the changed-only All Files rebuild reconciles like a full world landing",
     );
 }
 

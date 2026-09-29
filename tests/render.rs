@@ -410,6 +410,28 @@ fn reviewed_changes_rows_mark_and_subdue_file_details_without_losing_selection()
 }
 
 #[test]
+fn reviewed_but_changed_rows_warn_without_subduing_file_details() {
+    let r = Repo::init();
+    r.write("a.rs", "one\n");
+    r.commit_all("init");
+    r.write("a.rs", "one\ntwo\n");
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+    r.write("a.rs", "one\ntwo\nthree\n");
+    app.reload().unwrap();
+
+    let buf = render_buffer(&app);
+    let (y, row) = files_row_at(&buf, "a.rs");
+    assert!(row.contains("M ! a.rs"), "changed reviews carry a warning: {row:?}");
+    let marker_x = FILES_X0 + row_token_offset(&row, "!");
+    let path_x = FILES_X0 + row_token_offset(&row, "a.rs");
+    let stats_x = FILES_X0 + row_token_offset(&row, "+2");
+    assert_eq!(buf.cell((marker_x, y)).unwrap().fg, app.palette().orange);
+    assert_eq!(buf.cell((path_x, y)).unwrap().fg, app.palette().text);
+    assert_eq!(buf.cell((stats_x, y)).unwrap().fg, app.palette().green);
+}
+
+#[test]
 fn reviewed_changed_kinds_keep_their_status_and_notice_semantics() {
     let r = Repo::init();
     r.write(".gitattributes", "*.bin binary\n*.nodiff -diff\n");

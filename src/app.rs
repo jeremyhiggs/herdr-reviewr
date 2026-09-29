@@ -56,6 +56,21 @@ pub enum Focus {
     Diff,
 }
 
+/// A changed file's session-only review state in the active comparison.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileReviewState {
+    #[default]
+    Unreviewed,
+    Reviewed,
+    ReviewedButChanged,
+}
+
+#[derive(Clone, Debug)]
+enum ReviewMark {
+    Reviewed(FileIdentity),
+    Changed,
+}
+
 /// What the file-list cursor points at, by path, so it can be restored to the same target
 /// after the tree rebuilds on a poll.
 enum Anchor {
@@ -697,9 +712,9 @@ pub struct App {
     /// changeset and is never stashed per tab: scopes and explicit selections own review
     /// decisions, while tabs are only two views over the same active comparison.
     review_context: Option<ReviewContext>,
-    /// Human-authored, session-only file review decisions. A value is the exact comparison
-    /// the reviewer accepted, so a successful landing can permanently discard stale marks.
-    reviewed: HashMap<ReviewContext, HashMap<String, FileIdentity>>,
+    /// Human-authored, session-only file review decisions. Each value remembers the exact
+    /// comparison the reviewer accepted and whether a later successful landing changed it.
+    reviewed: HashMap<ReviewContext, HashMap<String, ReviewMark>>,
     pub diff: FileDiff,
     /// The rows actually shown: `diff.rows` with each fold collapsed to a marker or
     /// expanded to its lines. The cursor, scroll, selection, and hit-testing index this.
@@ -1142,7 +1157,7 @@ impl App {
         self.reviewed = std::mem::take(&mut old.reviewed);
         if let Some(context) = self.review_context.clone() {
             let changed = self.changed.clone();
-            self.prune_reviewed(&context, &changed);
+            self.reconcile_reviewed(&context, &changed);
         }
         self.navigator_side_pct = old.navigator_side_pct;
         self.navigator_stack_pct = old.navigator_stack_pct;
@@ -1365,7 +1380,7 @@ impl App {
 
     /// Adopt one complete scope build. This is the sole successful-landing boundary for the
     /// active changeset, its semantic review namespace, the header metadata, and reviewed-mark
-    /// invalidation. Callers must set prospective selection state before calling it.
+    /// reconciliation. Callers must set prospective selection state before calling it.
     fn adopt_changeset(
         &mut self,
         review_context: ReviewContext,
@@ -1373,20 +1388,29 @@ impl App {
         branch_base: git::BaseStatus,
         pick_status: Option<PickStatus>,
     ) {
-        self.prune_reviewed(&review_context, &changed);
+        self.reconcile_reviewed(&review_context, &changed);
         self.review_context = Some(review_context);
         self.changed = changed;
         self.adopt_branch_base(branch_base);
         self.adopt_pick_status(pick_status);
     }
 
-    /// Permanently remove decisions invalidated by a successful snapshot in this context.
-    /// Other contexts are deliberately untouched, and removed values are never reconstructed
-    /// from identity history, so restoring old bytes cannot resurrect a review decision.
-    fn prune_reviewed(&mut self, context: &ReviewContext, changed: &HashMap<String, Annotation>) {
+    /// Reconcile review decisions after a successful snapshot in this context. A present file
+    /// whose identity changed becomes permanently stale until the reviewer accepts it again;
+    /// a disappeared file is forgotten so reintroducing the path starts unreviewed. Other
+    /// contexts are deliberately untouched.
+    fn reconcile_reviewed(
+        &mut self,
+        context: &ReviewContext,
+        changed: &HashMap<String, Annotation>,
+    ) {
         let Some(reviewed) = self.reviewed.get_mut(context) else { return };
-        reviewed.retain(|path, identity| {
-            changed.get(path).is_some_and(|annotation| annotation.identity == *identity)
+        reviewed.retain(|path, mark| {
+            let Some(annotation) = changed.get(path) else { return false };
+            if matches!(mark, ReviewMark::Reviewed(identity) if annotation.identity != *identity) {
+                *mark = ReviewMark::Changed;
+            }
+            true
         });
     }
 
@@ -2498,7 +2522,7 @@ impl App {
 
     /// Apply a build prepared by [`Self::build_rebase`]. Selection state must already name
     /// the prospective input; every operation from here is infallible, so the scope/base/pick,
-    /// headers, list, diff, and review pruning become visible as one transaction.
+    /// headers, list, diff, and review reconciliation become visible as one transaction.
     fn adopt_rebase(&mut self, build: RebaseBuild) {
         self.cache = DiffCache::new();
         match build {
@@ -4031,16 +4055,27 @@ impl App {
         self.changed.get(path)
     }
 
-    /// Whether `path` is reviewed in the active semantic comparison, for navigator rendering
-    /// and contextual actions. An identity mismatch is never reported as reviewed even before
-    /// the next successful snapshot gets a chance to prune it.
+    /// The three-state review status for `path` in the active semantic comparison.
+    pub fn file_review_state(&self, path: &str) -> FileReviewState {
+        let Some(context) = self.review_context.as_ref() else {
+            return FileReviewState::Unreviewed;
+        };
+        let Some(identity) = self.changed.get(path).map(|a| &a.identity) else {
+            return FileReviewState::Unreviewed;
+        };
+        match self.reviewed.get(context).and_then(|reviewed| reviewed.get(path)) {
+            None => FileReviewState::Unreviewed,
+            Some(ReviewMark::Changed) => FileReviewState::ReviewedButChanged,
+            Some(ReviewMark::Reviewed(reviewed)) if reviewed != identity => {
+                FileReviewState::ReviewedButChanged
+            }
+            Some(ReviewMark::Reviewed(_)) => FileReviewState::Reviewed,
+        }
+    }
+
+    /// Whether `path`'s current exact comparison has been reviewed.
     pub fn file_reviewed(&self, path: &str) -> bool {
-        let Some(context) = self.review_context.as_ref() else { return false };
-        let Some(identity) = self.changed.get(path).map(|a| &a.identity) else { return false };
-        self.reviewed
-            .get(context)
-            .and_then(|reviewed| reviewed.get(path))
-            .is_some_and(|reviewed| reviewed == identity)
+        self.file_review_state(path) == FileReviewState::Reviewed
     }
 
     /// The reviewed state of the one changed file the active Changes surface targets.
@@ -4048,16 +4083,16 @@ impl App {
     /// pass through [`Self::review_target`], so the advertised action cannot drift from the
     /// file a keypress would change.
     pub fn current_file_reviewed(&self) -> Option<bool> {
-        self.review_target().map(|(_, reviewed)| reviewed)
+        self.review_target().map(|(_, state)| state == FileReviewState::Reviewed)
     }
 
     /// Toggle the current human review target. A diff whose loaded identity no longer
     /// matches the landed changeset is not safe to mark: leave authored state untouched and
     /// ask the worker for a fresh atomic snapshot instead.
     pub fn toggle_current_file_reviewed(&mut self) {
-        if let Some((path, reviewed)) = self.review_target() {
+        if let Some((path, state)) = self.review_target() {
             let path = path.to_string();
-            self.set_file_reviewed(&path, !reviewed);
+            self.set_file_reviewed(&path, state != FileReviewState::Reviewed);
         } else if self.review_display_is_stale() {
             self.request_world_refresh(false, false);
         }
@@ -4066,7 +4101,7 @@ impl App {
     /// Resolve the single file represented by the active Changes surface. Files focus follows
     /// the selected file row; Diff focus follows the displayed path and additionally proves
     /// that the exact comparison painted in the reader is the one the world snapshot landed.
-    fn review_target(&self) -> Option<(&str, bool)> {
+    fn review_target(&self) -> Option<(&str, FileReviewState)> {
         if self.tab != Tab::Changes || self.mode != Mode::Normal {
             return None;
         }
@@ -4078,8 +4113,7 @@ impl App {
         if self.focus == Focus::Diff && self.diff.identity.as_ref() != Some(landed) {
             return None;
         }
-        let reviewed = self.file_reviewed(path);
-        Some((path, reviewed))
+        Some((path, self.file_review_state(path)))
     }
 
     /// Whether a review attempt failed specifically because the displayed diff identity is
@@ -4106,10 +4140,12 @@ impl App {
                 return false;
             };
             let paths = self.reviewed.entry(context).or_default();
-            if paths.get(path) == Some(&identity) {
+            if paths.get(path).is_some_and(
+                |mark| matches!(mark, ReviewMark::Reviewed(reviewed) if *reviewed == identity),
+            ) {
                 return false;
             }
-            paths.insert(path.to_string(), identity);
+            paths.insert(path.to_string(), ReviewMark::Reviewed(identity));
             return true;
         }
         self.reviewed.get_mut(&context).and_then(|paths| paths.remove(path)).is_some()
@@ -5386,7 +5422,7 @@ fn anchor(selected: &[Row]) -> Option<(Side, u32, u32, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, Mode};
+    use super::{App, FileReviewState, Mode};
     use crate::config::NavigatorPosition;
     use crate::model::{Comment, CommitPick, Scope, Side};
     use crate::world::{PickStatus, PickVerdict};
@@ -5460,7 +5496,7 @@ mod tests {
     }
 
     #[test]
-    fn config_recovery_carries_reviews_then_prunes_against_the_loaded_context() {
+    fn config_recovery_carries_reviews_then_reconciles_the_loaded_context() {
         let context = crate::model::ReviewContext::Uncommitted;
         let identity = |new_content| {
             crate::model::FileIdentity::from_git(crate::model::FileIdentityInput {
@@ -5493,8 +5529,8 @@ mod tests {
         assert!(old.set_file_reviewed("changed.rs", true));
         assert!(old.set_file_reviewed("gone.rs", true));
 
-        // Recovery has already loaded a fresh snapshot before authored state transfers. Only
-        // the still-present exact identity survives that successful context.
+        // Recovery has already loaded a fresh snapshot before authored state transfers. The
+        // changed review becomes stale, while the disappeared path is forgotten.
         let mut recovered = App::new(PathBuf::from("."), Scope::Uncommitted, None);
         recovered.review_context = Some(context);
         recovered.changed.insert("kept.rs".to_string(), annotation(identity("kept")));
@@ -5502,7 +5538,11 @@ mod tests {
         recovered.carry_authored_state_from(&mut old);
 
         assert!(recovered.file_reviewed("kept.rs"), "an exact review survives recovery");
-        assert!(!recovered.file_reviewed("changed.rs"), "a changed identity is pruned");
+        assert_eq!(
+            recovered.file_review_state("changed.rs"),
+            FileReviewState::ReviewedButChanged,
+            "a changed identity is retained as stale",
+        );
         assert!(!recovered.file_reviewed("gone.rs"), "the recovered loaded context prunes it");
     }
 

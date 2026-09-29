@@ -19,7 +19,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Band, Focus, FooterAction, Mode, Tab};
+use crate::app::{App, Band, FileReviewState, Focus, FooterAction, Mode, Tab};
 use crate::config::NavigatorPosition;
 use crate::diff::{FileDiff, FileState, Row};
 use crate::file_list::{Annotation, RowKind};
@@ -1536,6 +1536,7 @@ const DIR_DOT_RESERVE: usize = 2;
 /// The fixed Changes-only column after Git status: a check and its trailing gap. Directory
 /// and unreviewed rows keep the same cells blank, so every path starts in the same column.
 const REVIEW_MARK: &str = "✓ ";
+const CHANGED_REVIEW_MARK: &str = "! ";
 const REVIEW_MARK_RESERVE: usize = 2;
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
@@ -1613,7 +1614,7 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                     // column so the name lines up with a sibling directory.
                     let indent = if annotation.is_some() { nest } else { format!("{nest}  ") };
                     let reviewed = (app.tab == Tab::Changes)
-                        .then(|| app.file_reviewed(&app.entries[*index].path));
+                        .then(|| app.file_review_state(&app.entries[*index].path));
                     file_row_item(
                         &FileRowSpec {
                             indent: &indent,
@@ -1643,8 +1644,8 @@ struct FileRowSpec<'a> {
     annotation: Option<&'a Annotation>,
     name: &'a str,
     ignored: bool,
-    /// `Some` enables the Changes-only fixed review column; the value paints its check.
-    reviewed: Option<bool>,
+    /// `Some` enables the Changes-only fixed review column and paints its state marker.
+    reviewed: Option<FileReviewState>,
     emphasis: &'a [(u32, u32)],
 }
 
@@ -1660,7 +1661,11 @@ fn file_row_item(
 ) -> ListItem<'static> {
     let FileRowSpec { indent, annotation, name, ignored, reviewed, emphasis } = *row;
     let marker = annotation.map_or(String::new(), |a| format!("{} ", a.change.marker()));
-    let review_mark = reviewed.map(|marked| if marked { REVIEW_MARK } else { "  " });
+    let review_mark = reviewed.map(|state| match state {
+        FileReviewState::Unreviewed => "  ",
+        FileReviewState::Reviewed => REVIEW_MARK,
+        FileReviewState::ReviewedButChanged => CHANGED_REVIEW_MARK,
+    });
     let (additions, deletions) = annotation.map_or((0, 0), |a| (a.additions, a.deletions));
     let stats = stats_str(additions, deletions);
     let gap = if stats.is_empty() { 0 } else { 2 };
@@ -1676,16 +1681,21 @@ fn file_row_item(
         spans.push(Span::styled(marker, Style::default().fg(kind_color(p, a.change))));
     }
     if let Some(mark) = review_mark {
-        spans.push(if reviewed == Some(true) {
-            Span::styled(mark, Style::default().fg(p.green))
-        } else {
-            Span::raw(mark)
+        spans.push(match reviewed {
+            Some(FileReviewState::Reviewed) => Span::styled(mark, Style::default().fg(p.green)),
+            Some(FileReviewState::ReviewedButChanged) => {
+                Span::styled(mark, Style::default().fg(p.orange))
+            }
+            _ => Span::raw(mark),
         });
     }
     // A git-ignored file recedes into a dim basename; its change marker and stats keep their
     // color so a kept ignored file still reads as a change.
-    let base_style =
-        if ignored || reviewed == Some(true) { Style::default().fg(p.dim2) } else { text_style(p) };
+    let base_style = if ignored || reviewed == Some(FileReviewState::Reviewed) {
+        Style::default().fg(p.dim2)
+    } else {
+        text_style(p)
+    };
     // The match highlight follows the engine's spans onto the shown text, remapped across any
     // head-elision so a matched, still-visible character is never left unmarked.
     let shown_spans = remap_emphasis(emphasis, name, &shown);
@@ -1712,7 +1722,7 @@ fn file_row_item(
         let used: usize = spans.iter().map(Span::width).sum();
         let pad = width.saturating_sub(used + stats.width());
         spans.push(Span::raw(" ".repeat(pad)));
-        if reviewed == Some(true) {
+        if reviewed == Some(FileReviewState::Reviewed) {
             spans.push(Span::styled(stats, Style::default().fg(p.dim2)));
         } else {
             spans.extend(stats_spans(additions, deletions, p));
