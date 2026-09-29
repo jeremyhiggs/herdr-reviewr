@@ -1747,7 +1747,7 @@ impl App {
         match self.scope {
             Scope::Uncommitted => {
                 let old = git::file_content(&self.repo, "HEAD", old_path);
-                let new = worktree_content(&self.repo, new_path);
+                let new = worktree_diff_content(&self.repo, new_path);
                 (old, new)
             }
             Scope::Branch => {
@@ -1758,7 +1758,7 @@ impl App {
                     .and_then(|b| git::merge_base(&self.repo, b.oid()));
                 let old =
                     mb.map(|m| git::file_content(&self.repo, &m, old_path)).unwrap_or_default();
-                (old, worktree_content(&self.repo, new_path))
+                (old, worktree_diff_content(&self.repo, new_path))
             }
             Scope::LastTurn => {
                 let old = self
@@ -1766,7 +1766,7 @@ impl App {
                     .as_deref()
                     .map(|b| git::file_content(&self.repo, b, old_path))
                     .unwrap_or_default();
-                (old, worktree_content(&self.repo, new_path))
+                (old, worktree_diff_content(&self.repo, new_path))
             }
             // Both sides from the commits: `A^` and `B`.
             Scope::Commits => {
@@ -5353,13 +5353,21 @@ fn is_markdown_path(path: &str) -> bool {
 /// The working-tree content of `path`, lossily as UTF-8; empty when the file is
 /// absent (a deletion) or unreadable.
 fn worktree_content(repo: &std::path::Path, path: &str) -> String {
+    std::fs::read(repo.join(path))
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default()
+}
+
+/// The working-tree side of a Git diff. Git represents a symlink by its target text rather
+/// than the referent's contents.
+fn worktree_diff_content(repo: &std::path::Path, path: &str) -> String {
     let full = repo.join(path);
     if std::fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return std::fs::read_link(full)
             .map(|target| target.to_string_lossy().into_owned())
             .unwrap_or_default();
     }
-    std::fs::read(full).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+    worktree_content(repo, path)
 }
 
 /// The display text, Git mode, and raw-byte fingerprint from one read of a live side.

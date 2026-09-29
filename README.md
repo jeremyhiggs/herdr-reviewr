@@ -194,9 +194,10 @@ reviewr starts in **uncommitted**. `default_scope` changes that. Switching with 
 wins for the rest of the session. `g` without a pick opens the picker.
 
 Reviewed marks live only for the current session and are isolated by review context: each scope,
-base, and commit pick keeps its own marks. A mark clears automatically when that file's exact diff
-changes, including staged or unstaged content, mode, symlink target, or either comparison endpoint.
-reviewr never persists marks or writes them to Git.
+base, and commit pick keeps its own marks. When a file's exact diff changes, including staged or
+unstaged content, mode, symlink target, or either comparison endpoint, its green `✓` becomes an
+orange `!` until `R` accepts the new diff. A mark is removed only when the file leaves the
+changeset. reviewr never persists marks or writes them to Git.
 
 Every scope respects `.gitignore`, so build output never clutters **Changes**. To review a file,
 track it. **All files** still browses any ignored path.
@@ -474,7 +475,8 @@ The known constraints:
 - **Comments are in-memory and single-session** — closing the pane loses any you haven't sent
   or copied out.
 - **Reviewed marks are in-memory and comparison-specific** — they stay separate across scopes,
-  bases, and commit picks, and clear when the exact file diff changes.
+  bases, and commit picks. A changed diff turns `✓` into `!`; the mark disappears only when the
+  file leaves the changeset.
 - **Sending is all-or-nothing** — Send (or copy) delivers the whole set and clears it. A
   failure leaves everything in place.
 - **No line-number rebasing** — a comment stays locatable by its diff snippet, not its line
