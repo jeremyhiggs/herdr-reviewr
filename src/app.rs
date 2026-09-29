@@ -1566,16 +1566,15 @@ impl App {
             String::new()
         } else {
             let (old, new, loaded_identity) = if let Some(annotation) = annotation {
-                match self.identity_content_sides(
+                if let Ok((old, new, identity)) = self.identity_content_sides(
                     &path,
                     previous_path.as_deref(),
                     &annotation.identity,
                 ) {
-                    Ok((old, new, identity)) => (old, new, Some(identity)),
-                    Err(_) => {
-                        let (old, new) = self.content_sides(&path, previous_path.as_deref());
-                        (old, new, None)
-                    }
+                    (old, new, Some(identity))
+                } else {
+                    let (old, new) = self.content_sides(&path, previous_path.as_deref());
+                    (old, new, None)
                 }
             } else {
                 let (old, new) = self.content_sides(&path, previous_path.as_deref());

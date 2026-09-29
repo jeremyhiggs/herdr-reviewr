@@ -1950,12 +1950,12 @@ fn live_gitlink_fingerprints(
         return Ok(HashMap::new());
     }
 
-    let (heads, dirty) = gitlink_live_states(repo, &paths)?;
+    let live = gitlink_live_states(repo, &paths)?;
     let mut fingerprints = HashMap::with_capacity(paths.len());
     for path in paths {
         let change = &changes[path];
-        let checked_out = heads[path].clone().unwrap_or_else(|| change.new_oid.clone());
-        let dirty_state = dirty.get(path).map_or("..", String::as_str);
+        let checked_out = live.heads[path].clone().unwrap_or_else(|| change.new_oid.clone());
+        let dirty_state = live.dirty.get(path).map_or("..", String::as_str);
         fingerprints.insert(
             path.to_string(),
             ("160000".to_string(), gitlink_token(&checked_out, dirty_state)),
@@ -1974,10 +1974,11 @@ pub(crate) fn worktree_gitlink_content_identity(
     repo: &Path,
     path: &str,
 ) -> Result<(String, String)> {
-    let (heads, dirty) = gitlink_live_states(repo, &[path])?;
-    let checked_out =
-        heads[path].clone().with_context(|| format!("submodule {path:?} is not checked out"))?;
-    let dirty_state = dirty.get(path).map_or("..", String::as_str);
+    let live = gitlink_live_states(repo, &[path])?;
+    let checked_out = live.heads[path]
+        .clone()
+        .with_context(|| format!("submodule {path:?} is not checked out"))?;
+    let dirty_state = live.dirty.get(path).map_or("..", String::as_str);
     let suffix = if dirty_state == ".." { "" } else { "-dirty" };
     Ok((
         format!("Subproject commit {checked_out}{suffix}\n"),
@@ -1988,10 +1989,12 @@ pub(crate) fn worktree_gitlink_content_identity(
 /// Read each checked-out commit on both sides of the batched status query. A submodule
 /// moving during the query would otherwise combine one commit with another commit's dirty
 /// flags and certify a comparison that never existed.
-fn gitlink_live_states(
-    repo: &Path,
-    paths: &[&str],
-) -> Result<(HashMap<String, Option<String>>, HashMap<String, String>)> {
+struct GitlinkLiveState {
+    heads: HashMap<String, Option<String>>,
+    dirty: HashMap<String, String>,
+}
+
+fn gitlink_live_states(repo: &Path, paths: &[&str]) -> Result<GitlinkLiveState> {
     let read_heads = || {
         paths
             .iter()
@@ -2004,7 +2007,7 @@ fn gitlink_live_states(
     if before != after {
         bail!("a changed submodule moved while its identity was being read");
     }
-    Ok((after, dirty))
+    Ok(GitlinkLiveState { heads: after, dirty })
 }
 
 /// The nested tracked/untracked dirty flags from one NUL-safe status query over all gitlinks.
