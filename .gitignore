@@ -15,6 +15,9 @@ Cargo.lock.bak
 # herdr local state (if any lands here during dev)
 /.herdr-state/
 
+# Local planning artifacts
+/plans/
+
 # Prebuilt binary dropped by herdr/install.sh on `herdr plugin install`
 /bin/
 
