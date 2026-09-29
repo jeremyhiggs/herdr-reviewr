@@ -57,15 +57,14 @@ pub enum Focus {
 }
 
 /// A changed file's session-only review state in the active comparison.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileReviewState {
-    #[default]
     Unreviewed,
     Reviewed,
     ReviewedButChanged,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 enum ReviewMark {
     Reviewed(FileIdentity),
     Changed,
@@ -4083,16 +4082,16 @@ impl App {
     /// pass through [`Self::review_target`], so the advertised action cannot drift from the
     /// file a keypress would change.
     pub fn current_file_reviewed(&self) -> Option<bool> {
-        self.review_target().map(|(_, state)| state == FileReviewState::Reviewed)
+        self.review_target().map(|(_, reviewed)| reviewed)
     }
 
     /// Toggle the current human review target. A diff whose loaded identity no longer
     /// matches the landed changeset is not safe to mark: leave authored state untouched and
     /// ask the worker for a fresh atomic snapshot instead.
     pub fn toggle_current_file_reviewed(&mut self) {
-        if let Some((path, state)) = self.review_target() {
+        if let Some((path, reviewed)) = self.review_target() {
             let path = path.to_string();
-            self.set_file_reviewed(&path, state != FileReviewState::Reviewed);
+            self.set_file_reviewed(&path, !reviewed);
         } else if self.review_display_is_stale() {
             self.request_world_refresh(false, false);
         }
@@ -4101,7 +4100,7 @@ impl App {
     /// Resolve the single file represented by the active Changes surface. Files focus follows
     /// the selected file row; Diff focus follows the displayed path and additionally proves
     /// that the exact comparison painted in the reader is the one the world snapshot landed.
-    fn review_target(&self) -> Option<(&str, FileReviewState)> {
+    fn review_target(&self) -> Option<(&str, bool)> {
         if self.tab != Tab::Changes || self.mode != Mode::Normal {
             return None;
         }
@@ -4113,7 +4112,7 @@ impl App {
         if self.focus == Focus::Diff && self.diff.identity.as_ref() != Some(landed) {
             return None;
         }
-        Some((path, self.file_review_state(path)))
+        Some((path, self.file_reviewed(path)))
     }
 
     /// Whether a review attempt failed specifically because the displayed diff identity is
