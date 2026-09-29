@@ -4163,7 +4163,7 @@ fn the_pr_remedy_names_the_rebound_refresh_key() {
     use herdr_reviewr::forge::PrView;
 
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[keybindings]\nrefresh = [\"R\"]\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[keybindings]\nrefresh = [\"X\"]\n").unwrap();
     let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
 
     let repo = Repo::init();
@@ -4177,7 +4177,7 @@ fn the_pr_remedy_names_the_rebound_refresh_key() {
     ));
 
     assert!(
-        app.pr_notice().is_some_and(|notice| notice.ends_with("then press R.")),
+        app.pr_notice().is_some_and(|notice| notice.ends_with("then press X.")),
         "the remedy follows the active refresh binding: {:?}",
         app.pr_notice()
     );
@@ -4695,20 +4695,20 @@ fn toggle_reviewed_targets_the_active_changes_surface_and_updates_the_footer() {
 
     let selected = app.current_entry().unwrap().path.clone();
     assert!(has_review_action(&app));
-    assert!(footer_text(&app).contains("x review"));
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    assert!(footer_text(&app).contains("R review"));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(app.file_reviewed(&selected), "AE1: Files focus toggles the selected file");
-    assert!(footer_text(&app).contains("x unreview"));
+    assert!(footer_text(&app).contains("R unreview"));
 
     let dir_row = app.file_rows.iter().position(|row| row.dir_path() == Some("src")).unwrap();
     app.file_cursor = dir_row;
     assert!(!has_review_action(&app), "AE6: a directory offers no review action");
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(app.file_reviewed(&selected), "the directory press is inert");
 
     app.focus = Focus::Diff;
     assert!(has_review_action(&app), "AE2: Diff focus targets the displayed file behind a dir row");
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(!app.file_reviewed(&selected), "Diff focus toggles the display, not the directory");
 
     assert!(app.set_file_reviewed("other.rs", true));
@@ -4722,10 +4722,10 @@ fn toggle_reviewed_targets_the_active_changes_surface_and_updates_the_footer() {
         Some(selected.as_str()),
         "moving the row directly leaves the displayed diff independent"
     );
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(app.file_reviewed(&selected));
     assert!(app.file_reviewed("other.rs"));
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(!app.file_reviewed(&selected), "toggle-off affects only the displayed file");
     assert!(app.file_reviewed("other.rs"), "a sibling review remains untouched");
 }
@@ -4745,14 +4745,14 @@ fn toggle_reviewed_accepts_identified_notice_diffs_and_refreshes_a_stale_display
     assert!(app.visible.is_empty(), "the binary diff has no rows");
     assert!(app.diff.identity.is_some(), "the notice still records what was loaded");
     assert!(has_review_action(&app));
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(app.file_reviewed(&path));
 
     assert!(app.set_file_reviewed(&path, false));
     app.diff.identity = None;
     app.world_request = None;
     assert!(!has_review_action(&app), "a missing display identity withholds the footer action");
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(!app.file_reviewed(&path), "a stale display stores no mark");
     assert!(app.world_request.is_some(), "the attempted action requests a fresh world build");
 
@@ -4766,7 +4766,7 @@ fn toggle_reviewed_accepts_identified_notice_diffs_and_refreshes_a_stale_display
     app.diff.identity = Some(mismatched);
     app.world_request = None;
     assert!(!has_review_action(&app), "a mismatched display identity also withholds the action");
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(!app.file_reviewed(&path));
     assert!(app.world_request.is_some(), "a mismatched display also requests a rebuild");
 }
@@ -4792,26 +4792,26 @@ fn toggle_reviewed_is_gated_outside_changes_normal_mode() {
     for mode in modes {
         app.mode = mode;
         assert!(!has_review_action(&app), "{:#?} must not offer review", app.mode);
-        press(&mut app, &keymap, KeyCode::Char('x'));
+        press(&mut app, &keymap, KeyCode::Char('R'));
         assert!(!app.file_reviewed(&path), "{:#?} must not execute review", app.mode);
     }
 
     app.mode = Mode::Normal;
     enter_tab(&mut app, Tab::AllFiles);
     assert!(!has_review_action(&app));
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(!app.file_reviewed(&path), "AE6: All Files is inert");
 
     enter_tab(&mut app, Tab::Pr);
     assert!(!has_review_action(&app));
-    press(&mut app, &keymap, KeyCode::Char('x'));
+    press(&mut app, &keymap, KeyCode::Char('R'));
     assert!(!app.file_reviewed(&path), "AE6: PR is inert");
 }
 
 #[test]
 fn rebound_toggle_reviewed_dispatches_and_supplies_the_footer_key() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "[keybindings]\ntoggle-reviewed = [\"R\"]\n")
+    std::fs::write(dir.path().join("config.toml"), "[keybindings]\ntoggle-reviewed = [\"x\"]\n")
         .unwrap();
     let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
     let keymap = config.keymap().clone();
@@ -4820,10 +4820,10 @@ fn rebound_toggle_reviewed_dispatches_and_supplies_the_footer_key() {
     let mut app = app_on(&r);
     app.set_plugin_config(config);
     let path = app.current_entry().unwrap().path.clone();
-    press(&mut app, &keymap, KeyCode::Char('x'));
-    assert!(!app.file_reviewed(&path), "AE8: the old default is freed");
-    assert!(footer_text(&app).contains("R review"), "the footer uses the resolved keymap");
     press(&mut app, &keymap, KeyCode::Char('R'));
+    assert!(!app.file_reviewed(&path), "AE8: the old default is freed");
+    assert!(footer_text(&app).contains("x review"), "the footer uses the resolved keymap");
+    press(&mut app, &keymap, KeyCode::Char('x'));
     assert!(app.file_reviewed(&path), "AE8: the custom binding dispatches");
 }
 

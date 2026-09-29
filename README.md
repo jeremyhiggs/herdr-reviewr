@@ -83,7 +83,7 @@ Open reviewr next to your agent:
 2. **Focus the diff.** `Tab` switches panes.
 3. **Select lines.** `v`, then `j` / `k` to extend (or click or drag the gutter).
 4. **Comment.** `c`, type, `Enter`.
-5. **Mark reviewed.** `x` marks the current changed file with a `✓`; press it again to undo.
+5. **Mark reviewed.** `R` marks the current changed file with a `✓`; press it again to undo.
 6. **Send.** `s` sends every comment to the agent's input.
 
 The footer shows the next step. Press `?` for every key that works right now.
@@ -134,7 +134,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 
 | Key | Action |
 | --- | --- |
-| `x` | Mark / unmark the current changed file as reviewed |
+| `R` | Mark / unmark the current changed file as reviewed |
 | `v` | Select lines |
 | `c` | Comment on line or selection |
 | `e` | Edit the comment under the cursor, or open the file in your editor |
@@ -350,7 +350,7 @@ The action names and their defaults:
 | `navigator-position` | `p` |
 | `navigator-hide` | `z` |
 | `navigator-grow` / `navigator-shrink` | `<` / `>` |
-| `toggle-reviewed` | `x` |
+| `toggle-reviewed` | `R` |
 | `select` | `v` |
 | `comment` | `c` |
 | `edit` / `delete` | `e` / `d` |
