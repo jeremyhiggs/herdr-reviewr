@@ -1499,7 +1499,7 @@ pub fn changed_files(
     scope: Scope,
     branch_base: Option<&str>,
 ) -> Result<Vec<ChangedFile>> {
-    let (old_endpoint, numstat, name_status, raw) = match scope {
+    let (old_endpoint, numstat, raw) = match scope {
         Scope::Uncommitted => {
             // A repo with no commits has no HEAD; diff against the empty tree so a fresh
             // `git init` lists its files instead of erroring (which would kill the process).
@@ -1507,7 +1507,6 @@ pub fn changed_files(
             (
                 resolved_endpoint(repo, &base)?,
                 git(repo, &["diff", &base, "--numstat", "-z"])?,
-                git(repo, &["diff", &base, "--name-status", "-z"])?,
                 git(repo, &["diff", &base, "--raw", "--full-index", "-z"])?,
             )
         }
@@ -1515,7 +1514,6 @@ pub fn changed_files(
             Some(r) => (
                 resolved_endpoint(repo, &r)?,
                 git(repo, &["diff", &r, "--numstat", "-z"])?,
-                git(repo, &["diff", &r, "--name-status", "-z"])?,
                 git(repo, &["diff", &r, "--raw", "--full-index", "-z"])?,
             ),
             None => return Ok(Vec::new()),
@@ -1526,7 +1524,7 @@ pub fn changed_files(
     // Branch diffs against the worktree, so like uncommitted it carries untracked files
     // that `git diff` never reports.
     let include_untracked = matches!(scope, Scope::Uncommitted | Scope::Branch);
-    assemble(repo, &numstat, &name_status, &raw, include_untracked, &old_endpoint, "worktree", true)
+    assemble(repo, &numstat, &raw, include_untracked, &old_endpoint, "worktree", true)
 }
 
 /// The changed files between the turn baseline `tree` and the live worktree, for
@@ -1538,18 +1536,16 @@ pub fn changed_files(
 pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>> {
     let current = snapshot_worktree(repo)?;
     let numstat = git(repo, &["diff", tree, &current, "--numstat", "-z"])?;
-    let name_status = git(repo, &["diff", tree, &current, "--name-status", "-z"])?;
     let raw = git(repo, &["diff", tree, &current, "--raw", "--full-index", "-z"])?;
-    assemble(repo, &numstat, &name_status, &raw, false, tree, "worktree", true)
+    assemble(repo, &numstat, &raw, false, tree, "worktree", true)
 }
 
 /// The changed files between two commits, `old` against `new`, for the `commits` scope:
 /// both sides are committed trees, so no untracked pass runs. `old` may be the empty tree for a root commit.
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
     let numstat = git(repo, &["diff", old, new, "--numstat", "-z"])?;
-    let name_status = git(repo, &["diff", old, new, "--name-status", "-z"])?;
     let raw = git(repo, &["diff", old, new, "--raw", "--full-index", "-z"])?;
-    assemble(repo, &numstat, &name_status, &raw, false, old, new, false)
+    assemble(repo, &numstat, &raw, false, old, new, false)
 }
 
 fn resolved_endpoint(repo: &Path, rev: &str) -> Result<String> {
@@ -1795,13 +1791,12 @@ pub fn list_ignored_dir(repo: &Path, dir: &str) -> Vec<WorktreeEntry> {
     out
 }
 
-/// Build the sorted `ChangedFile` list from `git diff` numstat + name-status output,
+/// Build the sorted `ChangedFile` list from `git diff` numstat + raw output,
 /// optionally appending untracked files (which a `git diff` never reports).
 #[allow(clippy::too_many_arguments)]
 fn assemble(
     repo: &Path,
     numstat: &str,
-    name_status: &str,
     raw: &str,
     include_untracked: bool,
     old_endpoint: &str,
@@ -1812,7 +1807,10 @@ fn assemble(
     let raw = parse_raw_changes(raw)?;
     let mut seen = HashSet::new();
     let mut files = Vec::new();
-    for (kind, path, previous_path) in parse_name_status(name_status) {
+    for (path, meta) in &raw {
+        let kind = meta.kind;
+        let previous_path = meta.previous_path.clone();
+        let path = path.clone();
         if !seen.insert(path.clone()) {
             continue;
         }
@@ -1820,8 +1818,6 @@ fn assemble(
         // ordinary empty change rather than as git's no-text-diff verdict.
         let verdict = counts.get(&path).copied().unwrap_or(Some((0, 0)));
         let (additions, deletions) = verdict.unwrap_or((0, 0));
-        let meta =
-            raw.get(&path).with_context(|| format!("raw diff metadata missing for {path:?}"))?;
         let (new_mode, new_content) = if live_new_side {
             worktree_fingerprint(repo, &path, kind == ChangeKind::Deleted)?
         } else {
@@ -1906,6 +1902,8 @@ fn assemble(
 
 #[derive(Debug)]
 struct RawChange {
+    kind: ChangeKind,
+    previous_path: Option<String>,
     old_mode: String,
     new_mode: String,
     old_oid: String,
@@ -1932,12 +1930,25 @@ fn parse_raw_changes(out: &str) -> Result<HashMap<String, RawChange>> {
         let new_oid = parts.next().context("raw diff missing new object")?.to_string();
         let status = parts.next().context("raw diff missing status")?;
         let first = fields.next().context("raw diff missing path")?;
-        let path = if matches!(status.as_bytes().first(), Some(b'R' | b'C')) {
-            fields.next().context("raw rename missing destination")?
+        let status = status.as_bytes().first().copied();
+        let (kind, path, previous_path) = if matches!(status, Some(b'R' | b'C')) {
+            (
+                ChangeKind::Renamed,
+                fields.next().context("raw rename missing destination")?,
+                Some(first.to_string()),
+            )
         } else {
-            first
+            let kind = match status {
+                Some(b'A') => ChangeKind::Added,
+                Some(b'D') => ChangeKind::Deleted,
+                _ => ChangeKind::Modified,
+            };
+            (kind, first, None)
         };
-        changes.insert(path.to_string(), RawChange { old_mode, new_mode, old_oid, new_oid });
+        changes.insert(
+            path.to_string(),
+            RawChange { kind, previous_path, old_mode, new_mode, old_oid, new_oid },
+        );
     }
     Ok(changes)
 }
@@ -1987,22 +1998,6 @@ pub(crate) fn worktree_fingerprint(
         hasher.update(&buffer[..read]);
     }
     Ok((mode.to_string(), hasher.finalize().to_hex().to_string()))
-}
-
-/// Git mode of the worktree path a read pane just loaded. Missing paths are deletion mode.
-pub(crate) fn worktree_mode(repo: &Path, path: &str) -> String {
-    use std::os::unix::fs::PermissionsExt;
-
-    let Ok(metadata) = std::fs::symlink_metadata(repo.join(path)) else {
-        return "000000".to_string();
-    };
-    if metadata.file_type().is_symlink() {
-        "120000".to_string()
-    } else if metadata.permissions().mode() & 0o111 == 0 {
-        "100644".to_string()
-    } else {
-        "100755".to_string()
-    }
 }
 
 /// Of `paths`, those whose `diff` attribute git reports as unset — `-diff`, or the `binary`
@@ -2111,40 +2106,11 @@ fn parse_numstat(out: &str) -> HashMap<String, Option<(u32, u32)>> {
     map
 }
 
-/// `(kind, path, previous_path)` from `git diff --name-status -z`. Under `-z` each record is
-/// `STATUS\0PATH\0`, except a rename/copy is `R<score>\0OLD\0NEW\0` (status, then old and new
-/// as separate fields). A rename or copy takes the new path and carries its old path; every
-/// other kind has `previous_path == None`. Copy folds into `Renamed` — a copy's old content
-/// lives at the old path exactly like a rename, which is what `content_sides` reads.
-fn parse_name_status(out: &str) -> Vec<(ChangeKind, String, Option<String>)> {
-    let mut rows = Vec::new();
-    let mut it = out.split('\0');
-    while let Some(status) = it.next() {
-        let row = match status.chars().next() {
-            Some('A') => it.next().map(|p| (ChangeKind::Added, p.to_string(), None)),
-            Some('D') => it.next().map(|p| (ChangeKind::Deleted, p.to_string(), None)),
-            Some('R' | 'C') => {
-                let old = it.next();
-                it.next().map(|new| (ChangeKind::Renamed, new.to_string(), old.map(str::to_string)))
-            }
-            // Modified, type-changed, etc.; also skips the trailing empty record.
-            Some(_) => it.next().map(|p| (ChangeKind::Modified, p.to_string(), None)),
-            None => None,
-        };
-        if let Some((kind, path, prev)) = row
-            && !path.is_empty()
-        {
-            rows.push((kind, path, prev));
-        }
-    }
-    rows
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
-        parse_name_status, parse_numstat,
+        parse_numstat, parse_raw_changes,
     };
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
@@ -2546,26 +2512,25 @@ mod tests {
     }
 
     #[test]
-    fn name_status_kinds_and_rename_target() {
-        let rows =
-            parse_name_status("M\0src/a.rs\0A\0src/b.rs\0D\0src/c.rs\0R100\0old.rs\0new.rs\0");
-        assert_eq!(rows[0], (ChangeKind::Modified, "src/a.rs".to_string(), None));
-        assert_eq!(rows[1], (ChangeKind::Added, "src/b.rs".to_string(), None));
-        assert_eq!(rows[2], (ChangeKind::Deleted, "src/c.rs".to_string(), None));
-        assert_eq!(
-            rows[3],
-            (ChangeKind::Renamed, "new.rs".to_string(), Some("old.rs".to_string()))
-        );
+    fn raw_changes_carry_kinds_and_rename_target() {
+        let raw = parse_raw_changes(
+            ":100644 100644 aaa bbb M\0src/a.rs\0:000000 100644 000 bbb A\0src/b.rs\0\
+             :100644 000000 aaa 000 D\0src/c.rs\0:100644 100644 aaa bbb R100\0old.rs\0new.rs\0",
+        )
+        .unwrap();
+        assert_eq!(raw["src/a.rs"].kind, ChangeKind::Modified);
+        assert_eq!(raw["src/b.rs"].kind, ChangeKind::Added);
+        assert_eq!(raw["src/c.rs"].kind, ChangeKind::Deleted);
+        assert_eq!(raw["new.rs"].kind, ChangeKind::Renamed);
+        assert_eq!(raw["new.rs"].previous_path.as_deref(), Some("old.rs"));
     }
 
     #[test]
-    fn name_status_copy_keeps_the_new_path() {
+    fn raw_copy_keeps_the_new_path() {
         // A copy carries old + new like a rename; it must key under the new path, not collapse
         // to a Modified entry on the source path.
-        let rows = parse_name_status("C75\0orig.rs\0copy.rs\0");
-        assert_eq!(
-            rows[0],
-            (ChangeKind::Renamed, "copy.rs".to_string(), Some("orig.rs".to_string()))
-        );
+        let raw = parse_raw_changes(":100644 100644 aaa bbb C75\0orig.rs\0copy.rs\0").unwrap();
+        assert_eq!(raw["copy.rs"].kind, ChangeKind::Renamed);
+        assert_eq!(raw["copy.rs"].previous_path.as_deref(), Some("orig.rs"));
     }
 }

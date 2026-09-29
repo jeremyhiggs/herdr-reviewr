@@ -87,6 +87,23 @@ fn loaded_diff_uses_the_snapshot_endpoint_after_head_moves() {
     assert!(app.visible.iter().any(|row| row.text() == "new"), "the worktree side is shown");
 }
 
+#[test]
+fn loaded_text_with_invalid_utf8_keeps_its_raw_snapshot_identity() {
+    let r = Repo::init();
+    std::fs::write(r.path().join("bytes.txt"), b"old\n").unwrap();
+    r.commit_all("init");
+    std::fs::write(r.path().join("bytes.txt"), b"new \xff\n").unwrap();
+
+    let app = app_on(&r);
+    let landed = &app.current_entry().unwrap().annotation.as_ref().unwrap().identity;
+    assert_eq!(
+        app.diff.identity.as_ref(),
+        Some(landed),
+        "display replacement characters do not alter the raw-byte review identity",
+    );
+    assert_eq!(app.current_file_reviewed(), Some(false));
+}
+
 /// Settle the diff scroll with one display row per logical row (no wrap), for tests that
 /// drive short-line diffs — reveal the cursor, then bound the offset, as the loop does.
 fn clamp(app: &mut App, viewport: usize) {

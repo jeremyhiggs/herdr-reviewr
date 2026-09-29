@@ -330,14 +330,9 @@ impl FileDiff {
         previous_path: Option<String>,
         identity: FileIdentity,
     ) -> Self {
-        Self {
-            path,
-            previous_path,
-            state: FileState::Binary,
-            view: View::Diff,
-            rows: Vec::new(),
-            identity: Some(identity),
-        }
+        let mut notice = Self::binary_notice(path, previous_path);
+        notice.identity = Some(identity);
+        notice
     }
 
     /// The File-view `too_large` notice, for an over-budget file the caller declines to read.
@@ -582,7 +577,7 @@ impl DiffCache {
         new: &str,
         hl: &Highlighter,
     ) -> FileDiff {
-        let key = content_hash(previous_path.as_deref(), old, new, None);
+        let key = content_hash(previous_path.as_deref(), old, new);
         self.get_or_build(path.clone(), key, || FileDiff::build(path, previous_path, old, new, hl))
     }
 
@@ -597,7 +592,7 @@ impl DiffCache {
         identity: FileIdentity,
         hl: &Highlighter,
     ) -> FileDiff {
-        let key = content_hash(previous_path.as_deref(), old, new, Some(&identity));
+        let key = identity_hash(&identity);
         self.get_or_build(path.clone(), key, || {
             FileDiff::build_identified(path, previous_path, old, new, identity, hl)
         })
@@ -607,7 +602,7 @@ impl DiffCache {
     /// File-view entries are namespaced under a `file:` key so a path's File view and Diff
     /// view coexist in the cache instead of evicting each other on a tab switch.
     pub fn get_file(&mut self, path: String, content: &str, hl: &Highlighter) -> FileDiff {
-        let key = content_hash(None, content, content, None);
+        let key = content_hash(None, content, content);
         self.get_or_build(format!("file:{path}"), key, || FileDiff::build_file(path, content, hl))
     }
 
@@ -634,16 +629,16 @@ impl DiffCache {
     }
 }
 
-fn content_hash(
-    previous_path: Option<&str>,
-    old: &str,
-    new: &str,
-    identity: Option<&FileIdentity>,
-) -> u64 {
+fn content_hash(previous_path: Option<&str>, old: &str, new: &str) -> u64 {
     let mut h = DefaultHasher::new();
     previous_path.hash(&mut h);
     old.hash(&mut h);
     new.hash(&mut h);
+    h.finish()
+}
+
+fn identity_hash(identity: &FileIdentity) -> u64 {
+    let mut h = DefaultHasher::new();
     identity.hash(&mut h);
     h.finish()
 }

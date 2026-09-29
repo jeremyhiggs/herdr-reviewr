@@ -1565,21 +1565,17 @@ impl App {
             };
             String::new()
         } else {
-            let (old, new) = annotation.as_ref().map_or_else(
-                || self.content_sides(&path, previous_path.as_deref()),
-                |annotation| {
-                    self.identity_content_sides(
-                        &path,
-                        previous_path.as_deref(),
-                        &annotation.identity,
-                    )
-                },
-            );
-            let loaded_identity = annotation.map(|annotation| {
-                annotation
-                    .identity
-                    .with_loaded_worktree(&git::worktree_mode(&self.repo, &path), new.as_bytes())
-            });
+            let (old, new, loaded_identity) = if let Some(annotation) = annotation {
+                let (old, new, identity) = self.identity_content_sides(
+                    &path,
+                    previous_path.as_deref(),
+                    &annotation.identity,
+                );
+                (old, new, Some(identity))
+            } else {
+                let (old, new) = self.content_sides(&path, previous_path.as_deref());
+                (old, new, None)
+            };
             self.diff = match loaded_identity {
                 None => self.cache.get(path, previous_path, &old, &new, &self.highlighter),
                 Some(identity) => self.cache.get_identified(
@@ -1764,15 +1760,17 @@ impl App {
         path: &str,
         previous_path: Option<&str>,
         identity: &crate::model::FileIdentity,
-    ) -> (String, String) {
+    ) -> (String, String, crate::model::FileIdentity) {
         let old_path = previous_path.unwrap_or(path);
         let old = git::file_content(&self.repo, identity.old_endpoint(), old_path);
-        let new = if identity.uses_live_worktree() {
-            worktree_content(&self.repo, path)
+        if identity.uses_live_worktree() {
+            let (new, mode, fingerprint) = worktree_content_identity(&self.repo, path);
+            let loaded = identity.with_loaded_worktree_fingerprint(&mode, &fingerprint);
+            (old, new, loaded)
         } else {
-            git::file_content(&self.repo, identity.new_endpoint(), path)
-        };
-        (old, new)
+            let new = git::file_content(&self.repo, identity.new_endpoint(), path);
+            (old, new, identity.clone())
+        }
     }
 
     /// Whether the `commits` scope is active over a pruned pick: the empty state both panes
@@ -4051,12 +4049,7 @@ impl App {
         if self.focus == Focus::Diff && self.diff.identity.as_ref() != Some(landed) {
             return None;
         }
-        let reviewed = self
-            .review_context
-            .as_ref()
-            .and_then(|context| self.reviewed.get(context))
-            .and_then(|paths| paths.get(path))
-            .is_some_and(|identity| identity == landed);
+        let reviewed = self.file_reviewed(path);
         Some((path, reviewed))
     }
 
@@ -5303,6 +5296,30 @@ fn worktree_content(repo: &std::path::Path, path: &str) -> String {
             .unwrap_or_default();
     }
     std::fs::read(full).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
+}
+
+/// The display text, Git mode, and raw-byte fingerprint from one read of a live side.
+/// Display is lossy UTF-8, but identity remains byte-exact.
+fn worktree_content_identity(repo: &std::path::Path, path: &str) -> (String, String, String) {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let full = repo.join(path);
+    let Ok(metadata) = std::fs::symlink_metadata(&full) else {
+        let bytes = Vec::new();
+        return (String::new(), "000000".to_string(), crate::model::content_fingerprint(&bytes));
+    };
+    let (mode, bytes) = if metadata.file_type().is_symlink() {
+        let bytes = std::fs::read_link(&full)
+            .map(|target| target.as_os_str().as_bytes().to_vec())
+            .unwrap_or_default();
+        ("120000", bytes)
+    } else {
+        let mode = if metadata.permissions().mode() & 0o111 == 0 { "100644" } else { "100755" };
+        (mode, std::fs::read(full).unwrap_or_default())
+    };
+    let fingerprint = crate::model::content_fingerprint(&bytes);
+    (String::from_utf8_lossy(&bytes).into_owned(), mode.to_string(), fingerprint)
 }
 
 fn line_in(c: &Comment, row: &Row) -> bool {

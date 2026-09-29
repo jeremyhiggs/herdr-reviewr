@@ -100,7 +100,7 @@ pub enum ChangeKind {
 /// Its representation is deliberately private: UI and authored-state code may compare and
 /// retain identities, but Git remains the sole authority for constructing them.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct FileIdentity(FileIdentityParts);
+pub struct FileIdentity(std::sync::Arc<FileIdentityParts>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct FileIdentityParts {
@@ -141,7 +141,7 @@ pub(crate) struct FileIdentityInput<'a> {
 
 impl FileIdentity {
     pub(crate) fn from_git(input: FileIdentityInput<'_>) -> Self {
-        Self(FileIdentityParts {
+        Self(std::sync::Arc::new(FileIdentityParts {
             old_endpoint: input.old_endpoint.to_string(),
             new_endpoint: input.new_endpoint.to_string(),
             kind: input.kind,
@@ -153,22 +153,27 @@ impl FileIdentity {
             new_content: input.new_content.to_string(),
             binary: input.binary,
             live_new_side: input.live_new_side,
-        })
+        }))
     }
 
     /// Reproduce this comparison identity with the worktree side a reader actually loaded.
     /// Committed comparisons have no live side, so their identity is already exact.
+    #[cfg(test)]
     pub(crate) fn with_loaded_worktree(&self, mode: &str, content: &[u8]) -> Self {
+        if !self.uses_live_worktree() {
+            return self.clone();
+        }
         self.with_loaded_worktree_fingerprint(mode, &content_fingerprint(content))
     }
 
     pub(crate) fn with_loaded_worktree_fingerprint(&self, mode: &str, content: &str) -> Self {
-        let mut parts = self.0.clone();
-        if parts.live_new_side {
-            parts.new_mode = mode.to_string();
-            parts.new_content = content.to_string();
+        if !self.uses_live_worktree() {
+            return self.clone();
         }
-        Self(parts)
+        let mut parts = (*self.0).clone();
+        parts.new_mode = mode.to_string();
+        parts.new_content = content.to_string();
+        Self(std::sync::Arc::new(parts))
     }
 
     pub(crate) fn uses_live_worktree(&self) -> bool {
