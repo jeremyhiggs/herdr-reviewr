@@ -954,17 +954,39 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("config.toml"),
-            "[keybindings]\ncomment = [\"c\", \"ㅊ\"]\nsend = [\"x\"]\n",
+            "[keybindings]\ncomment = [\"c\", \"ㅊ\"]\nsend = [\"a\"]\n",
         )
         .unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         let keymap = config.keymap();
         assert_eq!(keymap.action_for(Key::plain('ㅊ')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
-        assert_eq!(keymap.action_for(Key::plain('x')), Some(Action::Send));
+        assert_eq!(keymap.action_for(Key::plain('a')), Some(Action::Send));
         assert_eq!(keymap.action_for(Key::plain('s')), None, "a binding replaces its defaults");
         assert_eq!(keymap.action_for(Key::plain('S')), None);
         assert_eq!(keymap.action_for(Key::plain('v')), Some(Action::Select), "unbound keep theirs");
+    }
+
+    #[test]
+    fn toggle_reviewed_rebinds_frees_x_and_keeps_collision_validation() {
+        use crate::keymap::{Action, Key};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, "[keybindings]\ntoggle-reviewed = [\"R\"]\n").unwrap();
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.keymap().action_for(Key::plain('R')), Some(Action::ToggleReviewed));
+        assert_eq!(config.keymap().action_for(Key::plain('x')), None, "the default is freed");
+        assert_eq!(config.to_json()["keybindings"]["toggle-reviewed"], serde_json::json!(["R"]));
+
+        std::fs::write(&path, "[keybindings]\ntoggle-reviewed = [\"c\"]\n").unwrap();
+        let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
+        assert!(
+            error.contains("`toggle-reviewed`")
+                && error.contains("`comment`")
+                && error.contains('c'),
+            "{error}"
+        );
     }
 
     #[test]

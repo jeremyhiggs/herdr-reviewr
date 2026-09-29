@@ -532,6 +532,7 @@ pub fn find_case_sensitive(query: &str) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FooterAction {
     Comment,
+    ToggleReviewed,
     Select,
     ClearSelection,
     EditComment,
@@ -4015,6 +4016,63 @@ impl App {
             .is_some_and(|reviewed| reviewed == identity)
     }
 
+    /// The reviewed state of the one changed file the active Changes surface targets.
+    /// `None` means the toggle is unavailable here. Both dispatch and footer eligibility
+    /// pass through [`Self::review_target`], so the advertised action cannot drift from the
+    /// file a keypress would change.
+    pub fn current_file_reviewed(&self) -> Option<bool> {
+        self.review_target().map(|(_, reviewed)| reviewed)
+    }
+
+    /// Toggle the current human review target. A diff whose loaded identity no longer
+    /// matches the landed changeset is not safe to mark: leave authored state untouched and
+    /// ask the worker for a fresh atomic snapshot instead.
+    pub fn toggle_current_file_reviewed(&mut self) {
+        if let Some((path, reviewed)) = self.review_target() {
+            let path = path.to_string();
+            self.set_file_reviewed(&path, !reviewed);
+        } else if self.review_display_is_stale() {
+            self.request_world_refresh(false, false);
+        }
+    }
+
+    /// Resolve the single file represented by the active Changes surface. Files focus follows
+    /// the selected file row; Diff focus follows the displayed path and additionally proves
+    /// that the exact comparison painted in the reader is the one the world snapshot landed.
+    fn review_target(&self) -> Option<(&str, bool)> {
+        if self.tab != Tab::Changes || self.mode != Mode::Normal {
+            return None;
+        }
+        let path = match self.focus {
+            Focus::Files => self.current_entry()?.path.as_str(),
+            Focus::Diff => self.diff_path.as_deref()?,
+        };
+        let landed = &self.changed.get(path)?.identity;
+        if self.focus == Focus::Diff && self.diff.identity.as_ref() != Some(landed) {
+            return None;
+        }
+        let reviewed = self
+            .review_context
+            .as_ref()
+            .and_then(|context| self.reviewed.get(context))
+            .and_then(|paths| paths.get(path))
+            .is_some_and(|identity| identity == landed);
+        Some((path, reviewed))
+    }
+
+    /// Whether a review attempt failed specifically because the displayed diff identity is
+    /// absent or stale. Other ineligible surfaces stay inert without scheduling work.
+    fn review_display_is_stale(&self) -> bool {
+        self.tab == Tab::Changes
+            && self.mode == Mode::Normal
+            && self.focus == Focus::Diff
+            && self.diff_path.as_deref().is_some_and(|path| {
+                self.changed
+                    .get(path)
+                    .is_some_and(|landed| self.diff.identity.as_ref() != Some(&landed.identity))
+            })
+    }
+
     /// Set the human review decision for one path in the active comparison. Target and
     /// displayed-diff eligibility are owned by the interaction layer; this state operation
     /// accepts only a path in the landed changeset and always stores that row's exact identity.
@@ -4566,6 +4624,16 @@ impl App {
                 .position(|&(a, band)| band == Do && a == A::NavigatorHide)
                 .unwrap_or(out.len());
             out.insert(at, (A::EditFile, Do));
+        }
+
+        // Review is a human action on one exact changed-file identity. It shares the same
+        // target resolver as dispatch and the dynamic label, including the loaded-diff guard.
+        if self.current_file_reviewed().is_some() {
+            let at = out
+                .iter()
+                .position(|&(a, band)| band == Do && a == A::NavigatorHide)
+                .unwrap_or(out.len());
+            out.insert(at, (A::ToggleReviewed, Do));
         }
 
         // An armed crossing leads row 1: nothing else on screen says the next press leaves the

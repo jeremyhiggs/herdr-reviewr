@@ -2561,6 +2561,10 @@ fn action_key_label(app: &App, action: FooterAction) -> (String, String) {
     let hint = |action: K| app.keymap().hint(action).label();
     let (k, l): (String, &str) = match action {
         A::Comment => (hint(K::Comment), "comment"),
+        A::ToggleReviewed => (
+            hint(K::ToggleReviewed),
+            if app.current_file_reviewed() == Some(true) { "unreview" } else { "review" },
+        ),
         // One word for one gesture: `v` marks a range end in the diff and the commit picker alike.
         A::Select | A::CommitAnchor => (hint(K::Select), "select"),
         A::ClearSelection => ("esc".into(), "clear"),
