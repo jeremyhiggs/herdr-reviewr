@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{ChangeKind, ChangedFile, Scope};
+use crate::model::{ChangeKind, ChangedFile, FileIdentity, FileIdentityInput, Scope};
 
 /// Run `git -C <repo> <args>` and return stdout. Errors on non-zero exit.
 fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -1499,20 +1499,24 @@ pub fn changed_files(
     scope: Scope,
     branch_base: Option<&str>,
 ) -> Result<Vec<ChangedFile>> {
-    let (numstat, name_status) = match scope {
+    let (old_endpoint, numstat, name_status, raw) = match scope {
         Scope::Uncommitted => {
             // A repo with no commits has no HEAD; diff against the empty tree so a fresh
             // `git init` lists its files instead of erroring (which would kill the process).
             let base = diff_base(repo);
             (
+                resolved_endpoint(repo, &base)?,
                 git(repo, &["diff", &base, "--numstat", "-z"])?,
                 git(repo, &["diff", &base, "--name-status", "-z"])?,
+                git(repo, &["diff", &base, "--raw", "--full-index", "-z"])?,
             )
         }
         Scope::Branch => match branch_base.and_then(|b| merge_base(repo, b)) {
             Some(r) => (
+                resolved_endpoint(repo, &r)?,
                 git(repo, &["diff", &r, "--numstat", "-z"])?,
                 git(repo, &["diff", &r, "--name-status", "-z"])?,
+                git(repo, &["diff", &r, "--raw", "--full-index", "-z"])?,
             ),
             None => return Ok(Vec::new()),
         },
@@ -1522,7 +1526,7 @@ pub fn changed_files(
     // Branch diffs against the worktree, so like uncommitted it carries untracked files
     // that `git diff` never reports.
     let include_untracked = matches!(scope, Scope::Uncommitted | Scope::Branch);
-    assemble(repo, &numstat, &name_status, include_untracked)
+    assemble(repo, &numstat, &name_status, &raw, include_untracked, &old_endpoint, "worktree", true)
 }
 
 /// The changed files between the turn baseline `tree` and the live worktree, for
@@ -1535,7 +1539,8 @@ pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>>
     let current = snapshot_worktree(repo)?;
     let numstat = git(repo, &["diff", tree, &current, "--numstat", "-z"])?;
     let name_status = git(repo, &["diff", tree, &current, "--name-status", "-z"])?;
-    assemble(repo, &numstat, &name_status, false)
+    let raw = git(repo, &["diff", tree, &current, "--raw", "--full-index", "-z"])?;
+    assemble(repo, &numstat, &name_status, &raw, false, tree, "worktree", true)
 }
 
 /// The changed files between two commits, `old` against `new`, for the `commits` scope:
@@ -1543,7 +1548,12 @@ pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>>
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
     let numstat = git(repo, &["diff", old, new, "--numstat", "-z"])?;
     let name_status = git(repo, &["diff", old, new, "--name-status", "-z"])?;
-    assemble(repo, &numstat, &name_status, false)
+    let raw = git(repo, &["diff", old, new, "--raw", "--full-index", "-z"])?;
+    assemble(repo, &numstat, &name_status, &raw, false, old, new, false)
+}
+
+fn resolved_endpoint(repo: &Path, rev: &str) -> Result<String> {
+    Ok(git(repo, &["rev-parse", "--verify", &format!("{rev}^{{tree}}")])?.trim().to_string())
 }
 
 /// `sha`'s first parent, or the empty tree when `sha` is a root commit: the old side of a
@@ -1787,13 +1797,19 @@ pub fn list_ignored_dir(repo: &Path, dir: &str) -> Vec<WorktreeEntry> {
 
 /// Build the sorted `ChangedFile` list from `git diff` numstat + name-status output,
 /// optionally appending untracked files (which a `git diff` never reports).
+#[allow(clippy::too_many_arguments)]
 fn assemble(
     repo: &Path,
     numstat: &str,
     name_status: &str,
+    raw: &str,
     include_untracked: bool,
+    old_endpoint: &str,
+    new_endpoint: &str,
+    live_new_side: bool,
 ) -> Result<Vec<ChangedFile>> {
     let counts = parse_numstat(numstat);
+    let raw = parse_raw_changes(raw)?;
     let mut seen = HashSet::new();
     let mut files = Vec::new();
     for (kind, path, previous_path) in parse_name_status(name_status) {
@@ -1804,6 +1820,26 @@ fn assemble(
         // ordinary empty change rather than as git's no-text-diff verdict.
         let verdict = counts.get(&path).copied().unwrap_or(Some((0, 0)));
         let (additions, deletions) = verdict.unwrap_or((0, 0));
+        let meta =
+            raw.get(&path).with_context(|| format!("raw diff metadata missing for {path:?}"))?;
+        let (new_mode, new_content) = if live_new_side {
+            worktree_fingerprint(repo, &path, kind == ChangeKind::Deleted)?
+        } else {
+            (meta.new_mode.clone(), meta.new_oid.clone())
+        };
+        let identity = FileIdentity::from_git(FileIdentityInput {
+            old_endpoint,
+            new_endpoint,
+            kind,
+            path: &path,
+            previous_path: previous_path.as_deref(),
+            old_mode: &meta.old_mode,
+            new_mode: &new_mode,
+            old_content: &meta.old_oid,
+            new_content: &new_content,
+            binary: verdict.is_none(),
+            live_new_side,
+        });
         files.push(ChangedFile {
             path,
             kind,
@@ -1811,6 +1847,7 @@ fn assemble(
             deletions,
             previous_path,
             binary: verdict.is_none(),
+            identity,
         });
     }
 
@@ -1837,6 +1874,20 @@ fn assemble(
                 untracked_additions(repo, &path)
             };
             let binary = additions.is_none();
+            let (new_mode, new_content) = worktree_fingerprint(repo, &path, false)?;
+            let identity = FileIdentity::from_git(FileIdentityInput {
+                old_endpoint,
+                new_endpoint,
+                kind: ChangeKind::Untracked,
+                path: &path,
+                previous_path: None,
+                old_mode: "000000",
+                new_mode: &new_mode,
+                old_content: "absent",
+                new_content: &new_content,
+                binary,
+                live_new_side,
+            });
             files.push(ChangedFile {
                 path,
                 kind: ChangeKind::Untracked,
@@ -1844,12 +1895,114 @@ fn assemble(
                 deletions: 0,
                 previous_path: None,
                 binary,
+                identity,
             });
         }
     }
 
     files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(files)
+}
+
+#[derive(Debug)]
+struct RawChange {
+    old_mode: String,
+    new_mode: String,
+    old_oid: String,
+    new_oid: String,
+}
+
+/// Parse `git diff --raw --full-index -z`, keyed by the new path (or the sole path for a
+/// deletion). The header and paths are separate NUL fields, so tabs and newlines in paths are
+/// never structural.
+fn parse_raw_changes(out: &str) -> Result<HashMap<String, RawChange>> {
+    let mut fields = out.split('\0');
+    let mut changes = HashMap::new();
+    while let Some(header) = fields.next() {
+        if header.is_empty() {
+            continue;
+        }
+        let mut parts = header
+            .strip_prefix(':')
+            .with_context(|| format!("malformed raw diff header {header:?}"))?
+            .split_whitespace();
+        let old_mode = parts.next().context("raw diff missing old mode")?.to_string();
+        let new_mode = parts.next().context("raw diff missing new mode")?.to_string();
+        let old_oid = parts.next().context("raw diff missing old object")?.to_string();
+        let new_oid = parts.next().context("raw diff missing new object")?.to_string();
+        let status = parts.next().context("raw diff missing status")?;
+        let first = fields.next().context("raw diff missing path")?;
+        let path = if matches!(status.as_bytes().first(), Some(b'R' | b'C')) {
+            fields.next().context("raw rename missing destination")?
+        } else {
+            first
+        };
+        changes.insert(path.to_string(), RawChange { old_mode, new_mode, old_oid, new_oid });
+    }
+    Ok(changes)
+}
+
+/// The current filesystem side as Git sees it: blob bytes (a symlink's target text, not the
+/// referent) and the index mode. This is one in-process pass over all live paths; no path forks
+/// a Git subprocess. A listed non-deletion that cannot be read fails the whole snapshot.
+pub(crate) fn worktree_fingerprint(
+    repo: &Path,
+    path: &str,
+    allow_missing: bool,
+) -> Result<(String, String)> {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let full = repo.join(path);
+    let metadata = match std::fs::symlink_metadata(&full) {
+        Ok(metadata) => metadata,
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(("000000".to_string(), crate::model::content_fingerprint(&[])));
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading metadata for {path:?}")),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&full)
+            .with_context(|| format!("reading symlink target for {path:?}"))?;
+        return Ok((
+            "120000".to_string(),
+            crate::model::content_fingerprint(target.as_os_str().as_bytes()),
+        ));
+    }
+    if !metadata.is_file() {
+        bail!("changed path {path:?} is not a regular file or symlink");
+    }
+    let mode = if metadata.permissions().mode() & 0o111 == 0 { "100644" } else { "100755" };
+    let mut file =
+        std::fs::File::open(&full).with_context(|| format!("reading changed file {path:?}"))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read =
+            file.read(&mut buffer).with_context(|| format!("hashing changed file {path:?}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((mode.to_string(), hasher.finalize().to_hex().to_string()))
+}
+
+/// Git mode of the worktree path a read pane just loaded. Missing paths are deletion mode.
+pub(crate) fn worktree_mode(repo: &Path, path: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = std::fs::symlink_metadata(repo.join(path)) else {
+        return "000000".to_string();
+    };
+    if metadata.file_type().is_symlink() {
+        "120000".to_string()
+    } else if metadata.permissions().mode() & 0o111 == 0 {
+        "100644".to_string()
+    } else {
+        "100755".to_string()
+    }
 }
 
 /// Of `paths`, those whose `diff` attribute git reports as unset — `-diff`, or the `binary`

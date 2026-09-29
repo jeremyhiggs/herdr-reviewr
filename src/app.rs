@@ -1497,16 +1497,57 @@ impl App {
             self.preview_expanded_details.clear();
         }
         self.diff_path = Some(path.clone());
+        let annotation = self.changed.get(&path).cloned();
         // Git already reported no text diff for this change — binary content, or a path whose
         // `diff` attribute `.gitattributes` unsets. Take that verdict rather than re-deciding
         // from content, which would paint a `-diff` lockfile as a full text diff, and skip
         // both blob reads while we are at it.
-        let new = if self.changed.get(&path).is_some_and(|a| a.binary) {
-            self.diff = FileDiff::binary_notice(path, previous_path);
+        let new = if annotation.as_ref().is_some_and(|a| a.binary) {
+            let loaded_identity = annotation.as_ref().and_then(|annotation| {
+                let identity = &annotation.identity;
+                if !identity.uses_live_worktree() {
+                    return Some(identity.clone());
+                }
+                git::worktree_fingerprint(
+                    &self.repo,
+                    &path,
+                    annotation.change == crate::model::ChangeKind::Deleted,
+                )
+                .ok()
+                .map(|(mode, content)| identity.with_loaded_worktree_fingerprint(&mode, &content))
+            });
+            self.diff = match loaded_identity {
+                Some(identity) => FileDiff::binary_notice_identified(path, previous_path, identity),
+                None => FileDiff::binary_notice(path, previous_path),
+            };
             String::new()
         } else {
-            let (old, new) = self.content_sides(&path, previous_path.as_deref());
-            self.diff = self.cache.get(path, previous_path, &old, &new, &self.highlighter);
+            let (old, new) = annotation.as_ref().map_or_else(
+                || self.content_sides(&path, previous_path.as_deref()),
+                |annotation| {
+                    self.identity_content_sides(
+                        &path,
+                        previous_path.as_deref(),
+                        &annotation.identity,
+                    )
+                },
+            );
+            let loaded_identity = annotation.map(|annotation| {
+                annotation
+                    .identity
+                    .with_loaded_worktree(&git::worktree_mode(&self.repo, &path), new.as_bytes())
+            });
+            self.diff = match loaded_identity {
+                None => self.cache.get(path, previous_path, &old, &new, &self.highlighter),
+                Some(identity) => self.cache.get_identified(
+                    path,
+                    previous_path,
+                    &old,
+                    &new,
+                    identity,
+                    &self.highlighter,
+                ),
+            };
             new
         };
         // Hold the new side as the preview's render input, the same current content the File
@@ -1670,6 +1711,25 @@ impl App {
                 (old, git::file_content(&self.repo, &pick.newest, new_path))
             }
         }
+    }
+
+    /// Load the comparison endpoints named by the landed row rather than re-resolving a moving
+    /// scope selector such as `HEAD`. The live side remains the worktree bytes read now, so an
+    /// intervening edit produces a different display identity and withholds review actions.
+    fn identity_content_sides(
+        &self,
+        path: &str,
+        previous_path: Option<&str>,
+        identity: &crate::model::FileIdentity,
+    ) -> (String, String) {
+        let old_path = previous_path.unwrap_or(path);
+        let old = git::file_content(&self.repo, identity.old_endpoint(), old_path);
+        let new = if identity.uses_live_worktree() {
+            worktree_content(&self.repo, path)
+        } else {
+            git::file_content(&self.repo, identity.new_endpoint(), path)
+        };
+        (old, new)
     }
 
     /// Whether the `commits` scope is active over a pruned pick: the empty state both panes
@@ -5069,9 +5129,13 @@ fn is_markdown_path(path: &str) -> bool {
 /// The working-tree content of `path`, lossily as UTF-8; empty when the file is
 /// absent (a deletion) or unreadable.
 fn worktree_content(repo: &std::path::Path, path: &str) -> String {
-    std::fs::read(repo.join(path))
-        .map(|b| String::from_utf8_lossy(&b).into_owned())
-        .unwrap_or_default()
+    let full = repo.join(path);
+    if std::fs::symlink_metadata(&full).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return std::fs::read_link(full)
+            .map(|target| target.to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    std::fs::read(full).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default()
 }
 
 fn line_in(c: &Comment, row: &Row) -> bool {

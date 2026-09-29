@@ -65,6 +65,28 @@ fn edited_repo() -> Repo {
     r
 }
 
+#[test]
+fn loaded_diff_uses_the_snapshot_endpoint_after_head_moves() {
+    let r = Repo::init();
+    r.write("a.rs", "old\n");
+    r.commit_all("init");
+    r.write("a.rs", "new\n");
+
+    let mut app = App::new(r.path_buf(), Scope::Uncommitted, None);
+    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    r.commit_all("head moved after snapshot");
+    app.reconcile_world(snapshot);
+
+    let landed = &app.current_entry().unwrap().annotation.as_ref().unwrap().identity;
+    assert_eq!(
+        app.diff.identity.as_ref(),
+        Some(landed),
+        "the displayed sides reproduce the landed comparison"
+    );
+    assert!(app.visible.iter().any(|row| row.text() == "old"), "the old snapshot side is shown");
+    assert!(app.visible.iter().any(|row| row.text() == "new"), "the worktree side is shown");
+}
+
 /// Settle the diff scroll with one display row per logical row (no wrap), for tests that
 /// drive short-line diffs — reveal the cursor, then bound the offset, as the loop does.
 fn clamp(app: &mut App, viewport: usize) {

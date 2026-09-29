@@ -143,6 +143,62 @@ fn lists_every_change_kind_with_stats() {
 }
 
 #[test]
+fn changed_file_identity_is_stable_and_tracks_bytes_not_numstat() {
+    let r = Repo::init();
+    r.write("same-lines.txt", "old\n");
+    r.commit_all("init");
+
+    r.write("same-lines.txt", "one\n");
+    let first =
+        by_path(&changed_files(r.path(), Scope::Uncommitted, None).unwrap())["same-lines.txt"]
+            .identity
+            .clone();
+    let rebuilt =
+        by_path(&changed_files(r.path(), Scope::Uncommitted, None).unwrap())["same-lines.txt"]
+            .identity
+            .clone();
+    assert_eq!(first, rebuilt, "an unchanged comparison has one stable identity");
+
+    r.write("same-lines.txt", "two\n");
+    let second =
+        by_path(&changed_files(r.path(), Scope::Uncommitted, None).unwrap())["same-lines.txt"]
+            .identity
+            .clone();
+    assert_ne!(first, second, "equal line counts must not hide changed bytes");
+}
+
+#[test]
+fn identities_cover_symlinks_mode_only_changes_and_unusual_paths() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let r = Repo::init();
+    r.git(&["config", "core.fileMode", "true"]);
+    r.write("target-one", "one\n");
+    r.write("script.sh", "#!/bin/sh\nexit 0\n");
+    symlink("target-one", r.path().join("current")).unwrap();
+    r.commit_all("init");
+
+    std::fs::remove_file(r.path().join("current")).unwrap();
+    symlink("target-two", r.path().join("current")).unwrap();
+    let mut permissions = std::fs::metadata(r.path().join("script.sh")).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(r.path().join("script.sh"), permissions).unwrap();
+    let unusual = "line\nbreak\tname.txt";
+    r.write(unusual, "new\n");
+
+    let first = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let second = changed_files(r.path(), Scope::Uncommitted, None).unwrap();
+    let first = by_path(&first);
+    let second = by_path(&second);
+    for path in ["current", "script.sh", unusual] {
+        assert_eq!(first[path].identity, second[path].identity, "stable identity for {path:?}");
+    }
+    assert_eq!(first["current"].kind, ChangeKind::Modified);
+    assert_eq!(first["script.sh"].kind, ChangeKind::Modified);
+    assert_eq!(first[unusual].kind, ChangeKind::Untracked);
+}
+
+#[test]
 fn file_content_reads_the_committed_version_not_the_worktree() {
     let r = Repo::init();
     r.write("a.rs", "alpha\nbeta\ngamma\n");
