@@ -1566,12 +1566,17 @@ impl App {
             String::new()
         } else {
             let (old, new, loaded_identity) = if let Some(annotation) = annotation {
-                let (old, new, identity) = self.identity_content_sides(
+                match self.identity_content_sides(
                     &path,
                     previous_path.as_deref(),
                     &annotation.identity,
-                );
-                (old, new, Some(identity))
+                ) {
+                    Ok((old, new, identity)) => (old, new, Some(identity)),
+                    Err(_) => {
+                        let (old, new) = self.content_sides(&path, previous_path.as_deref());
+                        (old, new, None)
+                    }
+                }
             } else {
                 let (old, new) = self.content_sides(&path, previous_path.as_deref());
                 (old, new, None)
@@ -1760,16 +1765,28 @@ impl App {
         path: &str,
         previous_path: Option<&str>,
         identity: &crate::model::FileIdentity,
-    ) -> (String, String, crate::model::FileIdentity) {
+    ) -> Result<(String, String, crate::model::FileIdentity)> {
         let old_path = previous_path.unwrap_or(path);
-        let old = git::file_content(&self.repo, identity.old_endpoint(), old_path);
+        let old = git::exact_file_content(
+            &self.repo,
+            identity.old_endpoint(),
+            old_path,
+            identity.has_old_side(),
+        )?
+        .unwrap_or_default();
         if identity.uses_live_worktree() {
             let (new, mode, fingerprint) = worktree_content_identity(&self.repo, path);
             let loaded = identity.with_loaded_worktree_fingerprint(&mode, &fingerprint);
-            (old, new, loaded)
+            Ok((old, new, loaded))
         } else {
-            let new = git::file_content(&self.repo, identity.new_endpoint(), path);
-            (old, new, identity.clone())
+            let new = git::exact_file_content(
+                &self.repo,
+                identity.new_endpoint(),
+                path,
+                identity.has_new_side(),
+            )?
+            .unwrap_or_default();
+            Ok((old, new, identity.clone()))
         }
     }
 

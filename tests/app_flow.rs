@@ -13,7 +13,7 @@ use herdr_reviewr::config::NavigatorPosition;
 use herdr_reviewr::export::ExportTarget;
 use herdr_reviewr::herdr::{AgentChoice, AgentSample};
 use herdr_reviewr::keymap::{Action, Key, KeyCode as BindingCode, Keymap};
-use herdr_reviewr::model::{Scope, Side};
+use herdr_reviewr::model::{CommitPick, Scope, Side};
 use herdr_reviewr::turn::Status;
 use herdr_reviewr::{handle_key, handle_mouse};
 use ratatui::crossterm::event::{
@@ -85,6 +85,32 @@ fn loaded_diff_uses_the_snapshot_endpoint_after_head_moves() {
     );
     assert!(app.visible.iter().any(|row| row.text() == "old"), "the old snapshot side is shown");
     assert!(app.visible.iter().any(|row| row.text() == "new"), "the worktree side is shown");
+}
+
+#[test]
+fn failed_pinned_blob_load_leaves_the_display_unidentified() {
+    let r = Repo::init();
+    r.git(&["config", "commit.gpgsign", "false"]);
+    r.write("a.rs", "old\n");
+    r.commit_all("init");
+    r.write("a.rs", "new\n");
+
+    let mut app = App::new(r.path_buf(), Scope::Uncommitted, None);
+    let snapshot = herdr_reviewr::world::build(&app.world_input()).unwrap();
+    let blob = r.git(&["rev-parse", "HEAD:a.rs"]).trim().to_string();
+    let object = r.path().join(".git/objects").join(&blob[..2]).join(&blob[2..]);
+    let hidden = object.with_extension("reviewr-test-hidden");
+    std::fs::rename(&object, &hidden).unwrap();
+
+    app.reconcile_world(snapshot);
+    app.focus = Focus::Diff;
+
+    assert!(app.diff.identity.is_none(), "a failed old-side load must not certify the display");
+    assert_eq!(app.current_file_reviewed(), None, "an unidentified diff is not reviewable");
+    app.toggle_current_file_reviewed();
+    assert!(!app.file_reviewed("a.rs"), "the failed load cannot create a review mark");
+
+    std::fs::rename(hidden, object).unwrap();
 }
 
 #[test]
@@ -4750,6 +4776,79 @@ fn reviewed_files_are_isolated_between_selected_bases() {
 }
 
 #[test]
+fn reviewed_files_are_isolated_between_last_turn_baselines() {
+    let r = Repo::init();
+    r.write("a.rs", "base\n");
+    r.commit_all("base");
+    let first = herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
+    r.write("a.rs", "middle\n");
+    let second = herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
+    r.write("a.rs", "current\n");
+
+    let mut app = App::new(r.path_buf(), Scope::LastTurn, None);
+    app.sync_turn_baseline(Some(first.clone()));
+    app.reload().unwrap();
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    app.sync_turn_baseline(Some(second.clone()));
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("a.rs"), "a second baseline owns an independent namespace");
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    app.sync_turn_baseline(Some(first.clone()));
+    app.reload().unwrap();
+    assert!(app.file_reviewed("a.rs"), "the exact first comparison restores its review");
+
+    r.write("a.rs", "changed after review\n");
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("a.rs"), "the active baseline prunes a changed comparison");
+    r.write("a.rs", "current\n");
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("a.rs"), "restoring bytes cannot resurrect a pruned review");
+
+    app.sync_turn_baseline(Some(second));
+    app.reload().unwrap();
+    assert!(app.file_reviewed("a.rs"), "an inactive baseline survives another context's prune");
+}
+
+#[test]
+fn reviewed_files_are_isolated_between_commit_picks() {
+    let r = Repo::init();
+    r.write("a.rs", "base\n");
+    r.commit_all("base");
+    let base = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("a.rs", "one\n");
+    r.commit_all("one");
+    let one = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.write("a.rs", "two\n");
+    r.commit_all("two");
+    let two = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    let first = CommitPick::single(&one);
+    let second = CommitPick::single(&two);
+
+    let mut app = App::new(r.path_buf(), Scope::Uncommitted, None);
+    app.reload().unwrap();
+    app.commit_pick = Some(first.clone());
+    app.set_scope(Scope::Commits).unwrap();
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    app.commit_pick = Some(second.clone());
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("a.rs"), "a second commit run owns an independent namespace");
+    assert!(app.set_file_reviewed("a.rs", true));
+
+    app.commit_pick = Some(first);
+    app.reload().unwrap();
+    assert!(app.file_reviewed("a.rs"), "the exact first run restores its review");
+
+    r.git(&["reset", "-q", "--hard", &base]);
+    r.git(&["reflog", "expire", "--expire=now", "--all"]);
+    r.git(&["gc", "-q", "--prune=now"]);
+    app.reload().unwrap();
+    assert!(!app.file_reviewed("a.rs"), "a disappeared run permanently prunes its review");
+}
+
+#[test]
 fn all_files_scope_rebuild_uses_the_same_review_pruning_boundary() {
     use herdr_reviewr::app::Tab;
 
@@ -4785,15 +4884,57 @@ fn stale_and_failed_world_results_do_not_touch_reviewed_state() {
     assert!(herdr_reviewr::land_world_completion(&mut app, stale, 4));
     assert!(app.file_reviewed("a.rs"), "a rejected input cannot prune review state");
 
+    let input = app.world_input();
+    std::fs::remove_file(r.path().join("a.rs")).unwrap();
+    std::fs::create_dir(r.path().join("a.rs")).unwrap();
+    std::fs::write(r.path().join("a.rs/child.rs"), "unsupported replacement\n").unwrap();
+    let failed_snapshot = herdr_reviewr::world::build(&input);
+    assert!(
+        failed_snapshot
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("not a regular file or symlink")),
+        "the real identity build fails whole for a listed non-file path"
+    );
     let failed = herdr_reviewr::world::WorldCompletion {
         generation: 5,
-        input: app.world_input(),
+        input,
         reveal: false,
         turn: None,
-        snapshot: Some(Err(anyhow::anyhow!("identity build failed"))),
+        snapshot: Some(failed_snapshot),
     };
     assert!(herdr_reviewr::land_world_completion(&mut app, failed, 5));
     assert!(app.file_reviewed("a.rs"), "a failed build cannot prune review state");
+}
+
+#[test]
+fn repository_probe_failure_keeps_the_landed_world_and_reviewed_state() {
+    let r = edited_repo();
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+    let before_entries = app.entries.clone();
+    let before_diff = app.diff.clone();
+    let input = app.world_input();
+
+    let git_dir = r.path().join(".git");
+    let saved_git_dir = r.path().join(".git-saved-for-probe-test");
+    std::fs::rename(&git_dir, &saved_git_dir).unwrap();
+    std::fs::write(&git_dir, "gitdir: missing-git-directory\n").unwrap();
+    let failed_snapshot = herdr_reviewr::world::build(&input);
+    std::fs::remove_file(&git_dir).unwrap();
+    std::fs::rename(&saved_git_dir, &git_dir).unwrap();
+
+    assert!(failed_snapshot.is_err(), "an established repository's failed probe is an error");
+    let failed = herdr_reviewr::world::WorldCompletion {
+        generation: 6,
+        input,
+        reveal: false,
+        turn: None,
+        snapshot: Some(failed_snapshot),
+    };
+    assert!(herdr_reviewr::land_world_completion(&mut app, failed, 6));
+    assert_eq!(app.entries, before_entries, "the last good navigator remains intact");
+    assert_eq!(app.diff, before_diff, "the last good diff remains intact");
+    assert!(app.file_reviewed("a.rs"), "a probe failure cannot prune authored review state");
 }
 
 #[test]

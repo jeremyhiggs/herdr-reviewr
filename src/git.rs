@@ -1300,6 +1300,20 @@ pub fn file_content(repo: &Path, rev: &str, path: &str) -> String {
     git_lenient(repo, &["show", &format!("{rev}:{path}")])
 }
 
+/// Load an identity-declared committed side. An absent side is not queried; every expected
+/// side must resolve successfully so callers never mistake a Git failure for empty content.
+pub(crate) fn exact_file_content(
+    repo: &Path,
+    rev: &str,
+    path: &str,
+    side_present: bool,
+) -> Result<Option<String>> {
+    if !side_present {
+        return Ok(None);
+    }
+    git(repo, &["show", &format!("{rev}:{path}")]).map(Some)
+}
+
 // --- base pick (branch scope) --------------------------------------------------
 //
 // One revision spelling per worktree: a blob under `refs/worktree/reviewr/base-pick`.

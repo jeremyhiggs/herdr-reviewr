@@ -188,6 +188,14 @@ impl FileIdentity {
         &self.0.new_endpoint
     }
 
+    pub(crate) fn has_old_side(&self) -> bool {
+        self.0.old_mode != "000000"
+    }
+
+    pub(crate) fn has_new_side(&self) -> bool {
+        self.0.new_mode != "000000"
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self::from_git(FileIdentityInput {

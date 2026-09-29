@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 
 use crate::app::Tab;
 use crate::file_list::{Annotation, Entry};
@@ -90,6 +90,22 @@ pub struct ScopeBuild {
     pub changed: Vec<ChangedFile>,
 }
 
+/// Whether this input is intentionally outside Git. `App` holds the resolved worktree root once
+/// startup has found one, so a `.git` marker with a failed probe is an established repository we
+/// failed to read, not a new non-repository directory. Preserve the last good world in that case.
+fn repository_available(repo: &Path) -> Result<bool> {
+    match git::worktree_of(repo) {
+        git::Worktree::Root(_) => Ok(true),
+        git::Worktree::Unknown => bail!("unable to probe repository at {}", repo.display()),
+        git::Worktree::Outside => match std::fs::symlink_metadata(repo.join(".git")) {
+            Ok(_) => bail!("unable to probe established repository at {}", repo.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("checking repository marker at {}", repo.display())),
+        },
+    }
+}
+
 /// Build the snapshot for `input`. The changeset is computed regardless of tab so the
 /// header count and comment staleness stay correct while `All files` lists the whole
 /// worktree. In `last-turn` with no baseline yet, the changeset is empty until a turn
@@ -97,7 +113,7 @@ pub struct ScopeBuild {
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
     // Outside a git repo, an empty snapshot paints the quiet empty state rather than a
     // failing status line every poll.
-    if !git::is_repo(&input.repo) {
+    if !repository_available(&input.repo)? {
         return Ok(WorldSnapshot {
             review_context: context_without_git(input),
             changed: HashMap::new(),
@@ -136,7 +152,7 @@ pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
         pick_status: None,
         changed,
     };
-    if !git::is_repo(&input.repo) {
+    if !repository_available(&input.repo)? {
         return Ok(plain(context_without_git(input), Vec::new()));
     }
     match input.scope {
