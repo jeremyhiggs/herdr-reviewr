@@ -196,6 +196,19 @@ impl FileIdentity {
         self.0.new_mode != "000000"
     }
 
+    pub(crate) fn old_gitlink_oid(&self) -> Option<&str> {
+        (self.0.old_mode == "160000").then_some(self.0.old_content.as_str())
+    }
+
+    pub(crate) fn new_is_gitlink(&self) -> bool {
+        self.0.new_mode == "160000"
+    }
+
+    pub(crate) fn committed_new_gitlink_oid(&self) -> Option<&str> {
+        (self.0.new_mode == "160000" && !self.uses_live_worktree())
+            .then_some(self.0.new_content.as_str())
+    }
+
     #[cfg(test)]
     pub(crate) fn fixture() -> Self {
         Self::from_git(FileIdentityInput {

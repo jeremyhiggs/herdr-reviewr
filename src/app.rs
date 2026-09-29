@@ -1767,25 +1767,38 @@ impl App {
         identity: &crate::model::FileIdentity,
     ) -> Result<(String, String, crate::model::FileIdentity)> {
         let old_path = previous_path.unwrap_or(path);
-        let old = git::exact_file_content(
-            &self.repo,
-            identity.old_endpoint(),
-            old_path,
-            identity.has_old_side(),
-        )?
-        .unwrap_or_default();
+        let old = if let Some(oid) = identity.old_gitlink_oid() {
+            format!("Subproject commit {oid}\n")
+        } else {
+            git::exact_file_content(
+                &self.repo,
+                identity.old_endpoint(),
+                old_path,
+                identity.has_old_side(),
+            )?
+            .unwrap_or_default()
+        };
         if identity.uses_live_worktree() {
-            let (new, mode, fingerprint) = worktree_content_identity(&self.repo, path);
+            let (new, mode, fingerprint) = if identity.new_is_gitlink() {
+                let (new, fingerprint) = git::worktree_gitlink_content_identity(&self.repo, path)?;
+                (new, "160000".to_string(), fingerprint)
+            } else {
+                worktree_content_identity(&self.repo, path)
+            };
             let loaded = identity.with_loaded_worktree_fingerprint(&mode, &fingerprint);
             Ok((old, new, loaded))
         } else {
-            let new = git::exact_file_content(
-                &self.repo,
-                identity.new_endpoint(),
-                path,
-                identity.has_new_side(),
-            )?
-            .unwrap_or_default();
+            let new = if let Some(oid) = identity.committed_new_gitlink_oid() {
+                format!("Subproject commit {oid}\n")
+            } else {
+                git::exact_file_content(
+                    &self.repo,
+                    identity.new_endpoint(),
+                    path,
+                    identity.has_new_side(),
+                )?
+                .unwrap_or_default()
+            };
             Ok((old, new, identity.clone()))
         }
     }

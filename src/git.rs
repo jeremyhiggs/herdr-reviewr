@@ -1518,18 +1518,10 @@ pub fn changed_files(
             // A repo with no commits has no HEAD; diff against the empty tree so a fresh
             // `git init` lists its files instead of erroring (which would kill the process).
             let base = diff_base(repo);
-            (
-                resolved_endpoint(repo, &base)?,
-                git(repo, &["diff", &base, "--numstat", "-z"])?,
-                git(repo, &["diff", &base, "--raw", "--full-index", "-z"])?,
-            )
+            worktree_diff(repo, &base)?
         }
         Scope::Branch => match branch_base.and_then(|b| merge_base(repo, b)) {
-            Some(r) => (
-                resolved_endpoint(repo, &r)?,
-                git(repo, &["diff", &r, "--numstat", "-z"])?,
-                git(repo, &["diff", &r, "--raw", "--full-index", "-z"])?,
-            ),
+            Some(r) => worktree_diff(repo, &r)?,
             None => return Ok(Vec::new()),
         },
         // `last-turn` and `commits` diff through their own entry points.
@@ -1541,6 +1533,21 @@ pub fn changed_files(
     assemble(repo, &numstat, &raw, include_untracked, &old_endpoint, "worktree", true)
 }
 
+/// Resolve a possibly-moving revision once, then use only that immutable endpoint for both
+/// halves of the worktree diff. The identity endpoint, numstat, and raw metadata therefore
+/// cannot describe different HEADs if an agent commits while this build is running.
+fn worktree_diff(repo: &Path, rev: &str) -> Result<(String, String, String)> {
+    let old_endpoint = resolved_endpoint(repo, rev)?;
+    let (numstat, raw) = worktree_diff_at(repo, &old_endpoint)?;
+    Ok((old_endpoint, numstat, raw))
+}
+
+fn worktree_diff_at(repo: &Path, old_endpoint: &str) -> Result<(String, String)> {
+    let numstat = git(repo, &["diff", old_endpoint, "--numstat", "-z"])?;
+    let raw = git(repo, &["diff", old_endpoint, "--raw", "--full-index", "--abbrev=64", "-z"])?;
+    Ok((numstat, raw))
+}
+
 /// The changed files between the turn baseline `tree` and the live worktree, for
 /// `last-turn`. Snapshots the worktree now and diffs tree-against-tree, so staged,
 /// unstaged, untracked, and committed-this-turn changes all show, with no phantom
@@ -1550,7 +1557,7 @@ pub fn changed_files(
 pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>> {
     let current = snapshot_worktree(repo)?;
     let numstat = git(repo, &["diff", tree, &current, "--numstat", "-z"])?;
-    let raw = git(repo, &["diff", tree, &current, "--raw", "--full-index", "-z"])?;
+    let raw = git(repo, &["diff", tree, &current, "--raw", "--full-index", "--abbrev=64", "-z"])?;
     assemble(repo, &numstat, &raw, false, tree, "worktree", true)
 }
 
@@ -1558,7 +1565,7 @@ pub fn changed_against_tree(repo: &Path, tree: &str) -> Result<Vec<ChangedFile>>
 /// both sides are committed trees, so no untracked pass runs. `old` may be the empty tree for a root commit.
 pub fn changed_between(repo: &Path, old: &str, new: &str) -> Result<Vec<ChangedFile>> {
     let numstat = git(repo, &["diff", old, new, "--numstat", "-z"])?;
-    let raw = git(repo, &["diff", old, new, "--raw", "--full-index", "-z"])?;
+    let raw = git(repo, &["diff", old, new, "--raw", "--full-index", "--abbrev=64", "-z"])?;
     assemble(repo, &numstat, &raw, false, old, new, false)
 }
 
@@ -1819,6 +1826,8 @@ fn assemble(
 ) -> Result<Vec<ChangedFile>> {
     let counts = parse_numstat(numstat);
     let raw = parse_raw_changes(raw)?;
+    let gitlinks =
+        if live_new_side { live_gitlink_fingerprints(repo, &raw)? } else { HashMap::new() };
     let mut seen = HashSet::new();
     let mut files = Vec::new();
     for (path, meta) in &raw {
@@ -1832,7 +1841,9 @@ fn assemble(
         // ordinary empty change rather than as git's no-text-diff verdict.
         let verdict = counts.get(&path).copied().unwrap_or(Some((0, 0)));
         let (additions, deletions) = verdict.unwrap_or((0, 0));
-        let (new_mode, new_content) = if live_new_side {
+        let (new_mode, new_content) = if let Some(fingerprint) = gitlinks.get(&path) {
+            fingerprint.clone()
+        } else if live_new_side {
             worktree_fingerprint(repo, &path, kind == ChangeKind::Deleted)?
         } else {
             (meta.new_mode.clone(), meta.new_oid.clone())
@@ -1922,6 +1933,169 @@ struct RawChange {
     new_mode: String,
     old_oid: String,
     new_oid: String,
+}
+
+/// Live gitlink identities for the changed set. One porcelain-v2 command reports dirty state
+/// for every changed submodule; checked-out commits come from each submodule's Git metadata
+/// in-process, so the cost never becomes one subprocess per changed path.
+fn live_gitlink_fingerprints(
+    repo: &Path,
+    changes: &HashMap<String, RawChange>,
+) -> Result<HashMap<String, (String, String)>> {
+    let paths: Vec<&str> = changes
+        .iter()
+        .filter_map(|(path, change)| (change.new_mode == "160000").then_some(path.as_str()))
+        .collect();
+    if paths.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let (heads, dirty) = gitlink_live_states(repo, &paths)?;
+    let mut fingerprints = HashMap::with_capacity(paths.len());
+    for path in paths {
+        let change = &changes[path];
+        let checked_out = heads[path].clone().unwrap_or_else(|| change.new_oid.clone());
+        let dirty_state = dirty.get(path).map_or("..", String::as_str);
+        fingerprints.insert(
+            path.to_string(),
+            ("160000".to_string(), gitlink_token(&checked_out, dirty_state)),
+        );
+    }
+    Ok(fingerprints)
+}
+
+fn gitlink_token(checked_out: &str, dirty_state: &str) -> String {
+    format!("gitlink:{checked_out}:{dirty_state}")
+}
+
+/// Display text and the exact identity token for one selected live gitlink. This is one
+/// batched status call for the loaded target, not a subprocess loop over the changeset.
+pub(crate) fn worktree_gitlink_content_identity(
+    repo: &Path,
+    path: &str,
+) -> Result<(String, String)> {
+    let (heads, dirty) = gitlink_live_states(repo, &[path])?;
+    let checked_out =
+        heads[path].clone().with_context(|| format!("submodule {path:?} is not checked out"))?;
+    let dirty_state = dirty.get(path).map_or("..", String::as_str);
+    let suffix = if dirty_state == ".." { "" } else { "-dirty" };
+    Ok((
+        format!("Subproject commit {checked_out}{suffix}\n"),
+        gitlink_token(&checked_out, dirty_state),
+    ))
+}
+
+/// Read each checked-out commit on both sides of the batched status query. A submodule
+/// moving during the query would otherwise combine one commit with another commit's dirty
+/// flags and certify a comparison that never existed.
+fn gitlink_live_states(
+    repo: &Path,
+    paths: &[&str],
+) -> Result<(HashMap<String, Option<String>>, HashMap<String, String>)> {
+    let read_heads = || {
+        paths
+            .iter()
+            .map(|path| Ok(((*path).to_string(), submodule_head(repo, path)?)))
+            .collect::<Result<HashMap<_, _>>>()
+    };
+    let before = read_heads()?;
+    let dirty = gitlink_dirty_states(repo, paths)?;
+    let after = read_heads()?;
+    if before != after {
+        bail!("a changed submodule moved while its identity was being read");
+    }
+    Ok((after, dirty))
+}
+
+/// The nested tracked/untracked dirty flags from one NUL-safe status query over all gitlinks.
+/// The commit-change flag is deliberately excluded: the checked-out commit already carries
+/// that fact, and staging the same commit must not change a worktree comparison identity.
+fn gitlink_dirty_states(repo: &Path, paths: &[&str]) -> Result<HashMap<String, String>> {
+    let mut args = vec![
+        "--no-optional-locks".to_string(),
+        "--literal-pathspecs".to_string(),
+        "status".to_string(),
+        "--porcelain=v2".to_string(),
+        "-z".to_string(),
+        "--untracked-files=all".to_string(),
+        "--ignore-submodules=none".to_string(),
+        "--".to_string(),
+    ];
+    args.extend(paths.iter().map(|path| (*path).to_string()));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = git(repo, &refs)?;
+
+    let mut states = HashMap::new();
+    let mut records = out.split('\0');
+    while let Some(record) = records.next() {
+        let fields = if record.starts_with("1 ") {
+            record.splitn(9, ' ').collect::<Vec<_>>()
+        } else if record.starts_with("2 ") {
+            let fields = record.splitn(10, ' ').collect::<Vec<_>>();
+            let _original_path = records.next();
+            fields
+        } else if record.starts_with("u ") {
+            record.splitn(11, ' ').collect::<Vec<_>>()
+        } else {
+            continue;
+        };
+        let Some(submodule) = fields.get(2).copied().filter(|field| field.starts_with('S')) else {
+            continue;
+        };
+        let Some(path) = fields.last().copied() else { continue };
+        let mut flags = submodule.chars();
+        let _marker = flags.next();
+        let _commit_changed = flags.next();
+        states.insert(path.to_string(), flags.collect());
+    }
+    Ok(states)
+}
+
+/// Read a checked-out submodule commit without forking Git. An absent `.git` means the
+/// gitlink is uninitialized; its raw/index object remains the best exact token available.
+fn submodule_head(repo: &Path, path: &str) -> Result<Option<String>> {
+    let dot_git = repo.join(path).join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let marker = match std::fs::read_to_string(&dot_git) {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading submodule metadata for {path:?}"));
+            }
+        };
+        let relative = marker
+            .trim()
+            .strip_prefix("gitdir:")
+            .context("submodule .git file missing gitdir")?
+            .trim();
+        repo.join(path).join(relative)
+    };
+
+    let head = std::fs::read_to_string(git_dir.join("HEAD"))
+        .with_context(|| format!("reading submodule HEAD for {path:?}"))?;
+    let head = head.trim();
+    let Some(reference) = head.strip_prefix("ref: ") else {
+        return Ok(Some(head.to_string()));
+    };
+    let loose = git_dir.join(reference);
+    match std::fs::read_to_string(&loose) {
+        Ok(oid) => return Ok(Some(oid.trim().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading submodule ref for {path:?}"));
+        }
+    }
+    let packed = std::fs::read_to_string(git_dir.join("packed-refs"))
+        .with_context(|| format!("reading packed submodule refs for {path:?}"))?;
+    packed
+        .lines()
+        .filter(|line| !line.starts_with(['#', '^']))
+        .find_map(|line| line.split_once(' ').filter(|(_, name)| *name == reference))
+        .map(|(oid, _)| Some(oid.to_string()))
+        .context("submodule HEAD ref missing from loose and packed refs")
 }
 
 /// Parse `git diff --raw --full-index -z`, keyed by the new path (or the sole path for a
@@ -2124,10 +2298,63 @@ fn parse_numstat(out: &str) -> HashMap<String, Option<(u32, u32)>> {
 mod tests {
     use super::{
         ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
-        parse_numstat, parse_raw_changes,
+        parse_numstat, parse_raw_changes, resolved_endpoint, worktree_diff_at,
     };
+    use std::path::Path;
+    use std::process::Command;
 
     const NONE: ForgeHosts<'_> = ForgeHosts { github: None, gitlab: None, azure_devops: None };
+
+    fn test_git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@herdr.test")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn plumbing_commit(repo: &Path, parent: Option<&str>, message: &str) -> String {
+        test_git(repo, &["add", "-A"]);
+        let tree = test_git(repo, &["write-tree"]);
+        let mut args = vec!["commit-tree", tree.as_str()];
+        if let Some(parent) = parent {
+            args.extend(["-p", parent]);
+        }
+        args.extend(["-m", message]);
+        let commit = test_git(repo, &args);
+        test_git(repo, &["update-ref", "HEAD", &commit]);
+        commit
+    }
+
+    #[test]
+    fn resolved_worktree_diff_stays_on_its_endpoint_after_head_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        test_git(repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a.rs"), "one\n").unwrap();
+        let first = plumbing_commit(repo, None, "first");
+        let endpoint = resolved_endpoint(repo, "HEAD").unwrap();
+        let first_blob = test_git(repo, &["rev-parse", &format!("{first}:a.rs")]);
+
+        std::fs::write(repo.join("a.rs"), "two\n").unwrap();
+        let second = plumbing_commit(repo, Some(&first), "second");
+        std::fs::write(repo.join("a.rs"), "three\n").unwrap();
+        let (_numstat, raw) = worktree_diff_at(repo, &endpoint).unwrap();
+        let changes = parse_raw_changes(&raw).unwrap();
+
+        assert_ne!(endpoint, second);
+        assert_eq!(
+            changes["a.rs"].old_oid, first_blob,
+            "raw metadata remains pinned to the resolved endpoint"
+        );
+    }
 
     #[test]
     fn repo_identity_ignores_case_but_not_forge_host_or_depth() {

@@ -5,6 +5,7 @@ mod common;
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Result, bail};
 use common::{Repo, app_on, enter_tab, typed};
@@ -25,6 +26,34 @@ use ratatui::layout::Rect;
 struct FakeTarget {
     ok: bool,
     captured: RefCell<Vec<String>>,
+}
+
+fn git_at(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@herdr.test")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@herdr.test")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+fn plumbing_commit(repo: &Path, parent: Option<&str>, message: &str) -> String {
+    git_at(repo, &["add", "-A"]);
+    let tree = git_at(repo, &["write-tree"]);
+    let mut args = vec!["commit-tree", tree.as_str()];
+    if let Some(parent) = parent {
+        args.extend(["-p", parent]);
+    }
+    args.extend(["-m", message]);
+    let commit = git_at(repo, &args);
+    git_at(repo, &["update-ref", "HEAD", &commit]);
+    commit
 }
 
 impl FakeTarget {
@@ -128,6 +157,54 @@ fn loaded_text_with_invalid_utf8_keeps_its_raw_snapshot_identity() {
         "display replacement characters do not alter the raw-byte review identity",
     );
     assert_eq!(app.current_file_reviewed(), Some(false));
+}
+
+#[test]
+fn loaded_gitlink_reproduces_snapshot_identity_and_dirty_display() {
+    let source = Repo::init();
+    source.git(&["config", "commit.gpgsign", "false"]);
+    source.write("tracked.txt", "one\n");
+    source.commit_all("submodule base");
+
+    let r = Repo::init();
+    r.git(&["config", "commit.gpgsign", "false"]);
+    r.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        source.path().to_str().unwrap(),
+        "dep",
+    ]);
+    plumbing_commit(r.path(), None, "track submodule");
+
+    let dep = r.path().join("dep");
+    git_at(&dep, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(dep.join("tracked.txt"), "two\n").unwrap();
+    git_at(&dep, &["add", "tracked.txt"]);
+    git_at(&dep, &["commit", "-q", "-m", "advance"]);
+
+    let mut app = app_on(&r);
+    app.focus = Focus::Diff;
+    let landed = &app.current_entry().unwrap().annotation.as_ref().unwrap().identity;
+    assert_eq!(app.diff.identity.as_ref(), Some(landed));
+    assert_eq!(app.current_file_reviewed(), Some(false));
+    assert!(
+        app.visible.iter().any(|row| row.text().starts_with("Subproject commit ")),
+        "the gitlink diff uses Git's subproject display"
+    );
+
+    std::fs::write(dep.join("tracked.txt"), "dirty\n").unwrap();
+    app.reload().unwrap();
+    app.focus = Focus::Diff;
+    let landed = &app.current_entry().unwrap().annotation.as_ref().unwrap().identity;
+    assert_eq!(app.diff.identity.as_ref(), Some(landed));
+    assert!(
+        app.visible.iter().any(|row| row.text().contains("-dirty")),
+        "nested dirtiness is visible and identity-bearing"
+    );
+    app.toggle_current_file_reviewed();
+    assert!(app.file_reviewed("dep"));
 }
 
 /// Settle the diff scroll with one display row per logical row (no wrap), for tests that
