@@ -1533,6 +1533,10 @@ const DIR_DOT: &str = "•";
 /// The columns every `All files` folder row keeps free for the dot (a gap and the glyph),
 /// so a folder name elides the same way whether or not the dot is painted.
 const DIR_DOT_RESERVE: usize = 2;
+/// The fixed Changes-only column after Git status: a check and its trailing gap. Directory
+/// and unreviewed rows keep the same cells blank, so every path starts in the same column.
+const REVIEW_MARK: &str = "✓ ";
+const REVIEW_MARK_RESERVE: usize = 2;
 
 fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
     let p = app.palette();
@@ -1575,16 +1579,21 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                     };
                     // On `All files` every folder row leaves the dot's columns free, so a
                     // name that has to elide reads the same expanded or collapsed. `Changes`
-                    // never paints the dot, so it reserves nothing. Elide the bare name, then
-                    // add the slash: eliding `name/` would cut at that slash and leave `…/`.
-                    let reserve = if app.tab == Tab::AllFiles { DIR_DOT_RESERVE } else { 0 };
+                    // reserves its review column instead. Elide the bare name, then add the
+                    // slash: eliding `name/` would cut at that slash and leave `…/`.
+                    let edge_reserve = if app.tab == Tab::AllFiles { DIR_DOT_RESERVE } else { 0 };
+                    let review_reserve =
+                        if app.tab == Tab::Changes { REVIEW_MARK_RESERVE } else { 0 };
                     let lead = format!("{nest}{arrow}");
-                    let budget = width.saturating_sub(lead.width() + reserve + 1).max(1);
+                    let budget = width
+                        .saturating_sub(lead.width() + review_reserve + edge_reserve + 1)
+                        .max(1);
                     let name = format!("{}/", elide_head(&row.name, budget));
-                    let mut spans = vec![
-                        Span::styled(lead, Style::default().fg(p.dim2)),
-                        Span::styled(name, name_style),
-                    ];
+                    let mut spans = vec![Span::styled(lead, Style::default().fg(p.dim2))];
+                    if app.tab == Tab::Changes {
+                        spans.push(Span::raw(" ".repeat(REVIEW_MARK_RESERVE)));
+                    }
+                    spans.push(Span::styled(name, name_style));
                     // A collapsed `All files` folder holding a change wears the dot: the
                     // question there is which folders to open, and the children are hidden.
                     // Expanded, its children carry their own markers. On `Changes` every
@@ -1599,16 +1608,19 @@ fn render_file_list(frame: &mut Frame, app: &App, area: Rect) {
                     }
                     selectable_row(p, spans, width, fill)
                 }
-                RowKind::File { annotation, .. } => {
+                RowKind::File { index, annotation } => {
                     // Unchanged files have no marker. Two spaces hold the chevron's
                     // column so the name lines up with a sibling directory.
                     let indent = if annotation.is_some() { nest } else { format!("{nest}  ") };
+                    let reviewed = (app.tab == Tab::Changes)
+                        .then(|| app.file_reviewed(&app.entries[*index].path));
                     file_row_item(
                         &FileRowSpec {
                             indent: &indent,
                             annotation: annotation.as_ref(),
                             name: &row.name,
                             ignored: row.ignored,
+                            reviewed,
                             emphasis: &[],
                         },
                         width,
@@ -1631,6 +1643,8 @@ struct FileRowSpec<'a> {
     annotation: Option<&'a Annotation>,
     name: &'a str,
     ignored: bool,
+    /// `Some` enables the Changes-only fixed review column; the value paints its check.
+    reviewed: Option<bool>,
     emphasis: &'a [(u32, u32)],
 }
 
@@ -1644,21 +1658,34 @@ fn file_row_item(
     fill: Option<Color>,
     p: &Palette,
 ) -> ListItem<'static> {
-    let FileRowSpec { indent, annotation, name, ignored, emphasis } = *row;
+    let FileRowSpec { indent, annotation, name, ignored, reviewed, emphasis } = *row;
     let marker = annotation.map_or(String::new(), |a| format!("{} ", a.change.marker()));
+    let review_mark = reviewed.map(|marked| if marked { REVIEW_MARK } else { "  " });
     let (additions, deletions) = annotation.map_or((0, 0), |a| (a.additions, a.deletions));
     let stats = stats_str(additions, deletions);
     let gap = if stats.is_empty() { 0 } else { 2 };
-    let fixed = indent.width() + marker.width() + stats.width() + gap;
+    let fixed = indent.width()
+        + marker.width()
+        + review_mark.map_or(0, UnicodeWidthStr::width)
+        + stats.width()
+        + gap;
     let shown = elide_head(name, width.saturating_sub(fixed).max(1));
 
     let mut spans = vec![Span::styled(indent.to_string(), text_style(p))];
     if let Some(a) = annotation {
         spans.push(Span::styled(marker, Style::default().fg(kind_color(p, a.change))));
     }
+    if let Some(mark) = review_mark {
+        spans.push(if reviewed == Some(true) {
+            Span::styled(mark, Style::default().fg(p.green))
+        } else {
+            Span::raw(mark)
+        });
+    }
     // A git-ignored file recedes into a dim basename; its change marker and stats keep their
     // color so a kept ignored file still reads as a change.
-    let base_style = if ignored { Style::default().fg(p.dim2) } else { text_style(p) };
+    let base_style =
+        if ignored || reviewed == Some(true) { Style::default().fg(p.dim2) } else { text_style(p) };
     // The match highlight follows the engine's spans onto the shown text, remapped across any
     // head-elision so a matched, still-visible character is never left unmarked.
     let shown_spans = remap_emphasis(emphasis, name, &shown);
@@ -1685,7 +1712,11 @@ fn file_row_item(
         let used: usize = spans.iter().map(Span::width).sum();
         let pad = width.saturating_sub(used + stats.width());
         spans.push(Span::raw(" ".repeat(pad)));
-        spans.extend(stats_spans(additions, deletions, p));
+        if reviewed == Some(true) {
+            spans.push(Span::styled(stats, Style::default().fg(p.dim2)));
+        } else {
+            spans.extend(stats_spans(additions, deletions, p));
+        }
     }
     selectable_row(p, spans, width, fill)
 }
@@ -3745,6 +3776,7 @@ fn render_search_results(
                         annotation: app.changed_annotation(path),
                         name: path,
                         ignored: false,
+                        reviewed: None,
                         emphasis: &[],
                     },
                     width,
@@ -3764,6 +3796,7 @@ fn render_search_results(
                         annotation: app.changed_annotation(&hit.path),
                         name: &hit.path,
                         ignored: false,
+                        reviewed: None,
                         emphasis: &hit.spans,
                     },
                     width,
