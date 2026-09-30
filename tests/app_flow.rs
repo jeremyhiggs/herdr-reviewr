@@ -4996,16 +4996,12 @@ fn stale_and_failed_world_results_do_not_touch_reviewed_state() {
     assert!(app.file_reviewed("a.rs"), "a rejected input cannot prune review state");
 
     let input = app.world_input();
-    std::fs::remove_file(r.path().join("a.rs")).unwrap();
-    std::fs::create_dir(r.path().join("a.rs")).unwrap();
-    std::fs::write(r.path().join("a.rs/child.rs"), "unsupported replacement\n").unwrap();
+    let index = r.path().join(".git/index");
+    let saved_index = std::fs::read(&index).unwrap();
+    std::fs::write(&index, b"not a git index").unwrap();
     let failed_snapshot = herdr_reviewr::world::build(&input);
-    assert!(
-        failed_snapshot
-            .as_ref()
-            .is_err_and(|error| error.to_string().contains("not a regular file or symlink")),
-        "the real identity build fails whole for a listed non-file path"
-    );
+    std::fs::write(index, saved_index).unwrap();
+    assert!(failed_snapshot.is_err(), "an unreadable Git index fails the world build");
     let failed = herdr_reviewr::world::WorldCompletion {
         generation: 5,
         input,

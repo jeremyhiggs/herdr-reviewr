@@ -1841,10 +1841,12 @@ fn assemble(
         // ordinary empty change rather than as git's no-text-diff verdict.
         let verdict = counts.get(&path).copied().unwrap_or(Some((0, 0)));
         let (additions, deletions) = verdict.unwrap_or((0, 0));
-        let (new_mode, new_content) = if let Some(fingerprint) = gitlinks.get(&path) {
+        let (new_mode, new_content) = if kind == ChangeKind::Deleted {
+            ("000000".to_string(), crate::model::content_fingerprint(&[]))
+        } else if let Some(fingerprint) = gitlinks.get(&path) {
             fingerprint.clone()
         } else if live_new_side {
-            worktree_fingerprint(repo, &path, kind == ChangeKind::Deleted)?
+            worktree_fingerprint(repo, &path, false)?
         } else {
             (meta.new_mode.clone(), meta.new_oid.clone())
         };
