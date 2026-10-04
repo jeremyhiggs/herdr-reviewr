@@ -1889,7 +1889,7 @@ fn assemble(
         } else if let Some(fingerprint) = gitlinks.get(&path) {
             fingerprint.clone()
         } else if live_new_side {
-            worktree_fingerprint(repo, &path, false)?
+            worktree_fingerprint(repo, &path, true)?
         } else {
             (meta.new_mode.clone(), meta.new_oid.clone())
         };
@@ -1940,7 +1940,10 @@ fn assemble(
                 untracked_additions(repo, &path)
             };
             let binary = additions.is_none();
-            let (new_mode, new_content) = worktree_fingerprint(repo, &path, false)?;
+            let (new_mode, new_content) = worktree_fingerprint(repo, &path, true)?;
+            if new_mode == "000000" {
+                continue;
+            }
             let identity = FileIdentity::from_git(FileIdentityInput {
                 old_endpoint,
                 new_endpoint,
@@ -2350,7 +2353,7 @@ fn parse_numstat(out: &str) -> HashMap<String, Option<(u32, u32)>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
+        ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, assemble, classify_remote,
         parse_numstat, parse_raw_changes, resolved_endpoint, submodule_head, worktree_diff_at,
     };
     use std::path::Path;
@@ -2420,6 +2423,17 @@ mod tests {
         test_git(&source, &["worktree", "add", "-q", "-b", "linked", "../dep"]);
 
         assert_eq!(submodule_head(dir.path(), "dep").unwrap(), Some(commit));
+    }
+
+    #[test]
+    fn a_tracked_path_that_vanishes_during_assembly_keeps_an_uncertified_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = ":100644 100644 aaaa bbbb M\0gone.rs\0";
+        let files =
+            assemble(dir.path(), "1\t1\tgone.rs\0", raw, false, "old", "worktree", true).unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].identity.has_new_side());
     }
 
     #[test]
