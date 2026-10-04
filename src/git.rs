@@ -2136,14 +2136,19 @@ fn submodule_head(repo: &Path, path: &str) -> Result<Option<String>> {
             return Err(error).with_context(|| format!("reading submodule ref for {path:?}"));
         }
     }
-    let packed = std::fs::read_to_string(git_dir.join("packed-refs"))
-        .with_context(|| format!("reading packed submodule refs for {path:?}"))?;
-    packed
-        .lines()
-        .filter(|line| !line.starts_with(['#', '^']))
-        .find_map(|line| line.split_once(' ').filter(|(_, name)| *name == reference))
-        .map(|(oid, _)| Some(oid.to_string()))
-        .context("submodule HEAD ref missing from loose and packed refs")
+    if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs"))
+        && let Some((oid, _)) = packed
+            .lines()
+            .filter(|line| !line.starts_with(['#', '^']))
+            .find_map(|line| line.split_once(' ').filter(|(_, name)| *name == reference))
+    {
+        return Ok(Some(oid.to_string()));
+    }
+
+    // Linked worktrees and newer ref backends can keep the referenced branch outside this
+    // checkout's immediate Git directory. Let Git resolve those layouts; failure remains the
+    // clean absence used for an unborn branch.
+    Ok(git_line(&repo.join(path), &["rev-parse", "--verify", "-q", "HEAD"]))
 }
 
 /// Parse `git diff --raw --full-index -z`, keyed by the new path (or the sole path for a
@@ -2346,7 +2351,7 @@ fn parse_numstat(out: &str) -> HashMap<String, Option<(u32, u32)>> {
 mod tests {
     use super::{
         ChangeKind, Forge, ForgeHosts, RepoTarget, RepositoryIdentity, classify_remote,
-        parse_numstat, parse_raw_changes, resolved_endpoint, worktree_diff_at,
+        parse_numstat, parse_raw_changes, resolved_endpoint, submodule_head, worktree_diff_at,
     };
     use std::path::Path;
     use std::process::Command;
@@ -2402,6 +2407,19 @@ mod tests {
             changes["a.rs"].old_oid, first_blob,
             "raw metadata remains pinned to the resolved endpoint"
         );
+    }
+
+    #[test]
+    fn submodule_head_resolves_refs_kept_in_a_common_git_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        test_git(&source, &["init", "-q", "-b", "main"]);
+        std::fs::write(source.join("a.rs"), "one\n").unwrap();
+        let commit = plumbing_commit(&source, None, "first");
+        test_git(&source, &["worktree", "add", "-q", "-b", "linked", "../dep"]);
+
+        assert_eq!(submodule_head(dir.path(), "dep").unwrap(), Some(commit));
     }
 
     #[test]
