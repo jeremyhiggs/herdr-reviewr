@@ -904,6 +904,29 @@ fn branch_scope_equals_uncommitted_when_head_is_the_base() {
 }
 
 #[test]
+fn branch_scope_propagates_a_failed_merge_base_query() {
+    let r = Repo::init();
+    r.write("base.rs", "1\n");
+    r.commit_all("base");
+
+    let err = changed_files_oid(r.path(), Scope::Branch, Some("not-a-commit")).unwrap_err();
+    assert!(err.to_string().contains("git merge-base failed"), "{err:#}");
+}
+
+#[test]
+fn branch_scope_is_empty_when_histories_have_no_common_ancestor() {
+    let r = Repo::init();
+    r.write("base.rs", "1\n");
+    r.commit_all("base");
+    let base = r.git(&["rev-parse", "HEAD"]).trim().to_string();
+    r.git(&["checkout", "-q", "--orphan", "island"]);
+    r.git(&["commit", "-q", "--allow-empty", "-m", "island"]);
+
+    let files = changed_files_oid(r.path(), Scope::Branch, Some(&base)).unwrap();
+    assert!(files.is_empty(), "unrelated histories have no branch changeset");
+}
+
+#[test]
 fn ignored_paths_never_enter_changes() {
     let r = Repo::init();
     r.write(".gitignore", "ignored/\nbuild/\n");

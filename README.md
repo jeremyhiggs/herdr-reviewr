@@ -1,3 +1,14 @@
+<div align="center">
+  <sup>Special thanks to:</sup>
+  <br><br>
+  <a href="https://getmoshi.app/?utm_source=herdr-reviewr&utm_medium=readme&utm_campaign=sponsor"><img alt="Moshi" width="120" src="assets/sponsors/moshi.svg"></a>
+
+### [Moshi: Terminals weren’t made for phones. Moshi is.](https://getmoshi.app/?utm_source=herdr-reviewr&utm_medium=readme&utm_campaign=sponsor)
+[A mobile terminal designed for AI coding agents.](https://getmoshi.app/?utm_source=herdr-reviewr&utm_medium=readme&utm_campaign=sponsor)<br>
+
+  <hr />
+</div>
+
 # herdr-reviewr
 
 [![CI](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml/badge.svg)](https://github.com/persiyanov/herdr-reviewr/actions/workflows/ci.yml)
@@ -26,8 +37,8 @@ One persistent pane, pointed at a git worktree:
 - **Search** — fuzzy file names and live code grep across the worktree, powered by [fff](https://github.com/dmtrKovalenko/fff).
 - **Find in file** — search the open file and step between every match.
 - **PR view** — the branch's pull request in the pane, read-only.
-- **Markdown preview** — flip a `.md` file between source and rendered view.
-- **Themes** — 18 palettes in dark and light.
+- **Markdown review** — flip a `.md` file to rendered with `m`.
+- **Themes** — 20 palettes in dark and light.
 
 It never edits your worktree and sends nothing on its own. The **PR** tab reads GitHub,
 GitLab, or Azure DevOps and never posts.
@@ -122,13 +133,14 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `/` | Search files and code |
 | `Ctrl+F` | Find in file |
 | `w` | Toggle line wrap |
-| `m` | Preview markdown file |
+| `m` | Flip markdown between rendered and source |
 | `p` | Rotate navigator |
 | `z` | Hide / show navigator |
 | `<` `>` | Grow / shrink navigator |
 | `r` | Refresh |
 | `?` | Open shortcuts helper |
-| `q` | Quit |
+| `q` | Quit (asks first when comments are unsent) |
+| `Q` | Quit and drop unsent comments, when asked |
 
 **Reviewing** (in the diff)
 
@@ -228,6 +240,7 @@ The file accepts these keys:
 ```toml
 theme = "tokyo-night"
 default_scope = "branch"
+markdown_view = "rendered"
 navigator_position = "right"
 toggle_placement = "overlay"
 toggle_direction = "down"
@@ -254,11 +267,23 @@ theme = "tokyo-night"
 `--theme` overrides the file. Match your terminal's light or dark background. Available:
 
 - **Dark:** `catppuccin`, `catppuccin-frappe`, `catppuccin-macchiato`, `dracula`, `nord`,
-  `gruvbox`, `one-dark`, `solarized`, `monokai`, `tokyo-night`, `rose-pine`.
+  `gruvbox`, `one-dark`, `solarized`, `monokai`, `tokyo-night`, `rose-pine`,
+  `ayu`, `everforest`.
 - **Light:** `catppuccin-latte`, `gruvbox-light`, `one-light`, `solarized-light`,
   `github-light`, `tokyo-night-day`, `rose-pine-dawn`.
 
-Names match herdr's where both ship a palette.
+Names and accents match herdr's where both ship a palette, so focus in the pane matches herdr's
+frame. Every color stays readable on whatever sits behind it.
+
+### Markdown view
+
+Markdown opens as source. `m` flips to rendered, and every markdown file you open in the pane
+follows until you press `m` again. `markdown_view = "rendered"` opens it rendered from the
+start:
+
+```toml
+markdown_view = "rendered"
+```
 
 ### Navigator position
 
@@ -347,7 +372,7 @@ The action names and their defaults:
 | `base-pick` / `commit-pick` | `B` / `G` |
 | `tab-changes` / `tab-all-files` / `tab-pr` | `1` / `2` / `3` |
 | `wrap` | `w` |
-| `preview` | `m` |
+| `rendered` | `m` |
 | `navigator-position` | `p` |
 | `navigator-hide` | `z` |
 | `navigator-grow` / `navigator-shrink` | `<` / `>` |
@@ -365,6 +390,7 @@ The action names and their defaults:
 | `open-pr` | `o` |
 | `refresh` | `r` |
 | `quit` | `q` |
+| `quit-discard` | `Q` |
 
 A key is one printable character, or a `ctrl+`/`alt+` chord like `ctrl+f`. `Tab`, `Esc`, and
 `Enter` are fixed. Keys still type normally in the comment box.
@@ -456,6 +482,8 @@ The known constraints:
 **herdr coupling**
 - **Send needs an agent in the workspace** — one agent takes the comments straight away, and
   several open a picker so you choose. With no agent, Send says so and keeps your comments.
+- **Send refuses an agent at a permission prompt** — the prompt would drop the paste. Your
+  comments stay, so answer it and send again. A working agent takes them as usual.
 - **last turn relies on polling** (2 s default) — a turn that starts and finishes inside one
   poll is missed, and the scope shows everything since the last *observed* turn start, your
   own edits included.
@@ -511,8 +539,14 @@ herdr plugin link .
 
 Structured (JSON) export, a side-by-side split view,
 named-key notation for keybindings, OSC light/dark theme autodetect, more themes
-(`kanagawa`, `vesper`, `everforest`, `ayu`, a dark `github`), a `terminal`-following palette,
+(`kanagawa`, `vesper`, a dark `github`), a `terminal`-following palette,
 and OSC 52 clipboard.
+
+## Sponsors
+
+reviewr is built and maintained by one person. If it saves you review time, you can
+[sponsor its development](https://github.com/sponsors/persiyanov). Company sponsors get their
+logo here.
 
 ## License
 
@@ -525,3 +559,5 @@ Bundled `.tmTheme` syntax files in `assets/`, each under its own license:
 - [Catppuccin Mocha](https://github.com/catppuccin/bat) — MIT.
 - [Tokyo Night](https://github.com/folke/tokyonight.nvim) (`tokyo-night`, `tokyo-night-day`) — Apache-2.0.
 - [Rosé Pine](https://github.com/rose-pine/tm-theme) (`rose-pine`, `rose-pine-dawn`) — MIT.
+- [ayu](https://github.com/dempfi/ayu) (`ayu`) — MIT, converted from its Sublime color scheme.
+- [Everforest](https://github.com/sainnhe/everforest) (`everforest`) — MIT, built from its palette and highlight groups.

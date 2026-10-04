@@ -23,14 +23,67 @@ pub struct Span {
     pub color: Rgb,
 }
 
-/// A rendered diff row. Content rows (`Context`/`Deletion`/`Insertion`) are selectable
-/// for comments; a `Fold` is a collapsed run of context lines it owns.
+/// A rendered diff row. Content rows (`Context`/`Deletion`/`Insertion`/`Rendered`) are
+/// selectable for comments; a `Fold` is a collapsed run of context lines it owns.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Row {
-    Context { old_no: u32, new_no: u32, spans: Vec<Span> },
-    Deletion { old_no: u32, spans: Vec<Span>, emphasis: Vec<CharRange> },
-    Insertion { new_no: u32, spans: Vec<Span>, emphasis: Vec<CharRange> },
-    Fold { lines: Vec<Row> },
+    Context {
+        old_no: u32,
+        new_no: u32,
+        spans: Vec<Span>,
+    },
+    Deletion {
+        old_no: u32,
+        spans: Vec<Span>,
+        emphasis: Vec<CharRange>,
+    },
+    Insertion {
+        new_no: u32,
+        spans: Vec<Span>,
+        emphasis: Vec<CharRange>,
+    },
+    Fold {
+        lines: Vec<Row>,
+    },
+    /// One line of a markdown file's rendered view, pre-wrapped by the renderer. `src..=src_end`
+    /// is the 1-based source range its unit maps to: a block's, or the changed lines a marker
+    /// row stands for. `text` is the line as read — what find, copy, and selection see; the
+    /// paint styles it from the render the app holds. `kind` says which of the two it is.
+    Rendered {
+        src: u32,
+        src_end: u32,
+        text: String,
+        kind: RenderedKind,
+    },
+}
+
+/// What a rendered row is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderedKind {
+    /// A block's line: the source lines its own text comes from (first, last) and its wrap —
+    /// how many of the block's content lines start on that first line before it, `None` for
+    /// the blank gap set above the block — together its identity across a rebuild; the
+    /// styled line it paints; its change bar in the `Changes` tab; and, on a collapsed
+    /// `<details>` summary, how many changed lines its body hides.
+    Block { source: (u32, u32), wrap: Option<u32>, line: u32, bar: Option<Bar>, hides: Option<u32> },
+    /// A marker row standing for `lines` changed source lines no block shows. `gone` when
+    /// they are on the old side only: a block deleted whole.
+    Marker { kind: MarkerKind, lines: u32, gone: bool },
+}
+
+/// A changed block's bar: `Added` when it only gained lines, `Modified` otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Bar {
+    Added,
+    Modified,
+}
+
+/// A marker row's kind: `Removed` source deleted with its whole block, `Unrendered` changed
+/// source that renders nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum MarkerKind {
+    Removed,
+    Unrendered,
 }
 
 /// A `[start, end)` run of char indices within a line, for word-level emphasis.
@@ -40,14 +93,15 @@ impl Row {
     pub fn old_no(&self) -> Option<u32> {
         match self {
             Row::Context { old_no, .. } | Row::Deletion { old_no, .. } => Some(*old_no),
-            Row::Insertion { .. } | Row::Fold { .. } => None,
+            Row::Insertion { .. } | Row::Fold { .. } | Row::Rendered { .. } => None,
         }
     }
 
     pub fn new_no(&self) -> Option<u32> {
         match self {
             Row::Context { new_no, .. } | Row::Insertion { new_no, .. } => Some(*new_no),
-            Row::Deletion { .. } | Row::Fold { .. } => None,
+            // A rendered line is no source line: its unit names its range.
+            Row::Deletion { .. } | Row::Fold { .. } | Row::Rendered { .. } => None,
         }
     }
 
@@ -56,7 +110,7 @@ impl Row {
             Row::Context { spans, .. }
             | Row::Deletion { spans, .. }
             | Row::Insertion { spans, .. } => spans,
-            Row::Fold { .. } => &[],
+            Row::Rendered { .. } | Row::Fold { .. } => &[],
         }
     }
 
@@ -65,7 +119,7 @@ impl Row {
     pub fn emphasis(&self) -> &[CharRange] {
         match self {
             Row::Deletion { emphasis, .. } | Row::Insertion { emphasis, .. } => emphasis,
-            Row::Context { .. } | Row::Fold { .. } => &[],
+            Row::Context { .. } | Row::Fold { .. } | Row::Rendered { .. } => &[],
         }
     }
 
@@ -74,7 +128,7 @@ impl Row {
         match self {
             Row::Deletion { .. } => '-',
             Row::Insertion { .. } => '+',
-            Row::Context { .. } | Row::Fold { .. } => ' ',
+            Row::Context { .. } | Row::Fold { .. } | Row::Rendered { .. } => ' ',
         }
     }
 
@@ -102,7 +156,10 @@ impl Row {
 
     /// The line's plain text, joined from its spans.
     pub fn text(&self) -> String {
-        self.spans().iter().map(|s| s.text.as_str()).collect()
+        match self {
+            Row::Rendered { text, .. } => text.clone(),
+            _ => self.spans().iter().map(|s| s.text.as_str()).collect(),
+        }
     }
 
     /// The line as a marker-prefixed diff line, for the export snippet.
@@ -140,6 +197,9 @@ pub struct FileDiff {
     /// Identity of the comparison sides actually loaded for this Diff view. `None` for an
     /// empty placeholder, the All-files File view, and callers building a content-only model.
     pub identity: Option<FileIdentity>,
+    /// The `(old, new)` line numbers of each deletion paired with its homolog insertion — one
+    /// line edited, not one removed and another added ([`compute_emphasis`]).
+    pub pairs: Vec<(u32, u32)>,
 }
 
 /// A file beyond either budget renders as `too_large` rather than stalling the diff —
@@ -164,13 +224,20 @@ impl Default for FileDiff {
 impl FileDiff {
     /// An empty placeholder, for when no file is selected.
     pub fn empty() -> Self {
+        Self::rowless(String::new(), None, FileState::Normal, View::Diff)
+    }
+
+    /// A model with no rows: a notice in `state`, or the empty placeholder. Every constructor
+    /// without rows goes through it.
+    fn rowless(path: String, previous_path: Option<String>, state: FileState, view: View) -> Self {
         Self {
-            path: String::new(),
-            previous_path: None,
-            state: FileState::Normal,
-            view: View::Diff,
+            path,
+            previous_path,
+            state,
+            view,
             rows: Vec::new(),
             identity: None,
+            pairs: Vec::new(),
         }
     }
 
@@ -208,13 +275,10 @@ impl FileDiff {
         hl: &Highlighter,
     ) -> Self {
         let language = language_of(&path);
-        let notice = |state| Self {
-            path: path.clone(),
-            previous_path: previous_path.clone(),
-            state,
-            view: View::Diff,
-            rows: Vec::new(),
-            identity: identity.clone(),
+        let notice = |state| {
+            let mut diff = Self::rowless(path.clone(), previous_path.clone(), state, View::Diff);
+            diff.identity.clone_from(&identity);
+            diff
         };
         if old.contains('\0') || new.contains('\0') {
             return notice(FileState::Binary);
@@ -259,7 +323,7 @@ impl FileDiff {
                 }
             }
         }
-        compute_emphasis(&mut rows);
+        let pairs = compute_emphasis(&mut rows);
         Self {
             path,
             previous_path,
@@ -267,6 +331,7 @@ impl FileDiff {
             view: View::Diff,
             rows: collapse_context(&rows),
             identity,
+            pairs,
         }
     }
 
@@ -274,14 +339,7 @@ impl FileDiff {
     /// with no folds, change rows, or emphasis. Powers the `All files` tab.
     /// Degrades to a `binary` or `too_large` notice on the same budgets as [`build`](Self::build).
     fn build_file(path: String, content: &str, hl: &Highlighter) -> Self {
-        let notice = |state| Self {
-            path: path.clone(),
-            previous_path: None,
-            state,
-            view: View::File,
-            rows: Vec::new(),
-            identity: None,
-        };
+        let notice = |state| Self::rowless(path.clone(), None, state, View::File);
         if content.contains('\0') {
             return notice(FileState::Binary);
         }
@@ -301,28 +359,14 @@ impl FileDiff {
                 }
             })
             .collect();
-        Self {
-            path,
-            previous_path: None,
-            state: FileState::Normal,
-            view: View::File,
-            rows,
-            identity: None,
-        }
+        Self { rows, ..Self::rowless(path, None, FileState::Normal, View::File) }
     }
 
     /// The Diff-view `binary` notice, for a change git already reported as having no text
     /// diff. `set_diff` builds this rather than reading either side's blob, so a `-diff`
     /// lockfile costs no `git show` at all.
     pub fn binary_notice(path: String, previous_path: Option<String>) -> Self {
-        Self {
-            path,
-            previous_path,
-            state: FileState::Binary,
-            view: View::Diff,
-            rows: Vec::new(),
-            identity: None,
-        }
+        Self::rowless(path, previous_path, FileState::Binary, View::Diff)
     }
 
     pub(crate) fn binary_notice_identified(
@@ -338,14 +382,7 @@ impl FileDiff {
     /// The File-view `too_large` notice, for an over-budget file the caller declines to read.
     /// `set_file_view` checks the on-disk size and builds this rather than reading the bytes.
     pub fn too_large_notice(path: String) -> Self {
-        Self {
-            path,
-            previous_path: None,
-            state: FileState::TooLarge,
-            view: View::File,
-            rows: Vec::new(),
-            identity: None,
-        }
+        Self::rowless(path, None, FileState::TooLarge, View::File)
     }
 }
 
@@ -354,7 +391,7 @@ pub(crate) fn set_row_spans(row: &mut Row, next: Vec<Span>) {
         Row::Context { spans, .. } | Row::Deletion { spans, .. } | Row::Insertion { spans, .. } => {
             *spans = next;
         }
-        Row::Fold { .. } => {}
+        Row::Rendered { .. } | Row::Fold { .. } => {}
     }
 }
 
@@ -365,23 +402,45 @@ pub(crate) fn set_row_spans(row: &mut Row, next: Vec<Span>) {
 /// insertion similar enough to be the same line edited (see [`pair_homologs`], after
 /// git-delta's `infer_edits`). Lines with no homolog stay unemphasized, carrying only their
 /// red/green; emphasis then points at a real edit instead of flooding a wholesale rewrite.
-pub(crate) fn compute_emphasis(rows: &mut [Row]) {
+/// Returns the `(old, new)` line numbers of the pairs it found, in diff order.
+pub(crate) fn compute_emphasis(rows: &mut [Row]) -> Vec<(u32, u32)> {
+    let mut pairs = Vec::new();
+    for (dels, inss) in change_blocks(rows) {
+        pair_homologs(rows, dels, inss, &mut pairs);
+    }
+    pairs
+}
+
+/// Each change block of `rows` in order — a run of deletions followed by a run of
+/// insertions, either possibly empty but not both — as its deletions' and its insertions'
+/// index ranges.
+pub(crate) fn change_blocks<R: std::borrow::Borrow<Row>>(
+    rows: &[R],
+) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+    let is = |i: usize, deletion: bool| match rows.get(i).map(std::borrow::Borrow::borrow) {
+        Some(Row::Deletion { .. }) => deletion,
+        Some(Row::Insertion { .. }) => !deletion,
+        _ => false,
+    };
+    let mut out = Vec::new();
     let mut i = 0;
     while i < rows.len() {
         let del_start = i;
-        while i < rows.len() && matches!(rows[i], Row::Deletion { .. }) {
+        while is(i, true) {
             i += 1;
         }
         let ins_start = i;
-        while i < rows.len() && matches!(rows[i], Row::Insertion { .. }) {
+        while is(i, false) {
             i += 1;
         }
-        pair_homologs(rows, del_start..ins_start, ins_start..i);
-        // No change block started here; step over the context/fold row.
         if del_start == i {
+            // No change block started here; step over the context/fold row.
             i += 1;
+        } else {
+            out.push((del_start..ins_start, ins_start..i));
         }
     }
+    out
 }
 
 /// Pair each deletion in `dels` with its homolog insertion in `inss` and set both lines'
@@ -389,7 +448,12 @@ pub(crate) fn compute_emphasis(rows: &mut [Row]) {
 /// last-claimed one whose similarity clears [`MIN_SIMILARITY`]; insertions skipped along the
 /// way are abandoned (they were inserts, not edits of `d`). A deletion with no qualifying
 /// insertion is left unpaired. Mirrors git-delta's homolog inference.
-fn pair_homologs(rows: &mut [Row], dels: std::ops::Range<usize>, inss: std::ops::Range<usize>) {
+fn pair_homologs(
+    rows: &mut [Row],
+    dels: std::ops::Range<usize>,
+    inss: std::ops::Range<usize>,
+    pairs: &mut Vec<(u32, u32)>,
+) {
     let mut next_ins = inss.start;
     for d in dels {
         let old = rows[d].text();
@@ -403,6 +467,9 @@ fn pair_homologs(rows: &mut [Row], dels: std::ops::Range<usize>, inss: std::ops:
                 }
                 if let Row::Insertion { emphasis, .. } = &mut rows[p] {
                     *emphasis = new_e;
+                }
+                if let (Some(o), Some(n)) = (rows[d].old_no(), rows[p].new_no()) {
+                    pairs.push((o, n));
                 }
                 next_ins = p + 1;
                 break;

@@ -28,7 +28,7 @@ pub enum Action {
     TabAllFiles,
     TabPr,
     Wrap,
-    Preview,
+    Rendered,
     NavigatorPosition,
     NavigatorHide,
     NavigatorGrow,
@@ -49,6 +49,9 @@ pub enum Action {
     OpenPr,
     Refresh,
     Quit,
+    /// The quit question's answer: quit and drop the unsent comments. A key of its own, so a
+    /// held quit key's auto-repeat can never answer the question it just raised.
+    QuitDiscard,
 }
 
 /// A key's base: a printable character, or one of the named keys from the `[keybindings]`
@@ -157,7 +160,7 @@ impl Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 43] = [
+const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -180,7 +183,7 @@ const ACTIONS: [(Action, &str, &[Key]); 43] = [
     (Action::TabAllFiles, "tab-all-files", &[Key::plain('2')]),
     (Action::TabPr, "tab-pr", &[Key::plain('3')]),
     (Action::Wrap, "wrap", &[Key::plain('w')]),
-    (Action::Preview, "preview", &[Key::plain('m')]),
+    (Action::Rendered, "rendered", &[Key::plain('m')]),
     (Action::NavigatorPosition, "navigator-position", &[Key::plain('p')]),
     (Action::NavigatorHide, "navigator-hide", &[Key::plain('z')]),
     (Action::NavigatorGrow, "navigator-grow", &[Key::plain('<')]),
@@ -201,6 +204,7 @@ const ACTIONS: [(Action, &str, &[Key]); 43] = [
     (Action::OpenPr, "open-pr", &[Key::plain('o')]),
     (Action::Refresh, "refresh", &[Key::plain('r')]),
     (Action::Quit, "quit", &[Key::plain('q')]),
+    (Action::QuitDiscard, "quit-discard", &[Key::plain('Q')]),
 ];
 
 impl Action {
@@ -219,6 +223,7 @@ impl Action {
         match name {
             "list-wider" => Some(Self::NavigatorGrow),
             "list-narrower" => Some(Self::NavigatorShrink),
+            "preview" => Some(Self::Rendered),
             _ => Self::by_name(name),
         }
     }
@@ -276,14 +281,14 @@ impl Keymap {
                 match seen.iter().find(|(k, _)| *k == key) {
                     Some((_, first)) if first == action => {
                         return Err(format!(
-                            "{} is bound twice to `{}`",
+                            "`{}` is bound twice to `{}`",
                             key.config_str(),
                             action.name()
                         ));
                     }
                     Some((_, first)) => {
                         return Err(format!(
-                            "{} is bound to both `{}` and `{}`",
+                            "`{}` is bound to both `{}` and `{}`",
                             key.config_str(),
                             first.name(),
                             action.name()
@@ -328,7 +333,7 @@ mod tests {
         let keymap = Keymap::default();
         assert_eq!(keymap.action_for(Key::plain('c')), Some(Action::Comment));
         assert_eq!(keymap.action_for(Key::plain('S')), Some(Action::Send));
-        assert_eq!(keymap.action_for(Key::plain('m')), Some(Action::Preview));
+        assert_eq!(keymap.action_for(Key::plain('m')), Some(Action::Rendered));
         assert_eq!(keymap.action_for(Key::plain('p')), Some(Action::NavigatorPosition));
         assert_eq!(keymap.action_for(Key::plain('z')), Some(Action::NavigatorHide));
         assert_eq!(keymap.action_for(Key::plain('R')), Some(Action::ToggleReviewed));
@@ -365,6 +370,7 @@ mod tests {
         assert_eq!(Key::ctrl('u').label(), "ctrl+u");
         assert_eq!(Action::by_config_name("list-wider"), Some(Action::NavigatorGrow));
         assert_eq!(Action::by_config_name("list-narrower"), Some(Action::NavigatorShrink));
+        assert_eq!(Action::by_config_name("preview"), Some(Action::Rendered));
     }
 
     #[test]

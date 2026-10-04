@@ -18,11 +18,35 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
         .args(["-c", "core.quotepath=false"])
         .args(args)
         .output()
-        .with_context(|| format!("running git {args:?}"))?;
+        .map_err(|e| anyhow::anyhow!(git_error(args, "could not run", e)))?;
     if !out.status.success() {
-        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(git_error(args, "failed", String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A failed git call's message: the subcommand and git's own words for the reviewer, and the
+/// whole argv for the log.
+fn git_error(args: &[&str], what: &str, detail: impl std::fmt::Display) -> String {
+    crate::logln!("git {args:?} {what}: {detail}");
+    format!("git {} {what}: {detail}", subcommand(args))
+}
+
+/// The git subcommand an argv runs, for an error the reviewer reads: `rev-parse`, not the
+/// whole argv in Rust's debug quoting.
+fn subcommand<'a>(args: &[&'a str]) -> &'a str {
+    let mut rest = args.iter().copied();
+    while let Some(arg) = rest.next() {
+        match arg {
+            // A global option that takes the next word as its value.
+            "-c" | "-C" => {
+                rest.next();
+            }
+            arg if arg.starts_with('-') => {}
+            arg => return arg,
+        }
+    }
+    ""
 }
 
 /// Like [`git`], but returns stdout even on non-zero exit (e.g. `diff --no-index`).
@@ -462,7 +486,7 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<std::process::Output, GitFail> 
         .env("LC_ALL", "C")
         .args(args)
         .output()
-        .map_err(|e| GitFail(format!("git {args:?}: {e}")))
+        .map_err(|e| GitFail(git_error(args, "could not run", e)))
 }
 
 /// Run git where exit 0 is a value, exit 1 is a designated clean absence (`--verify
@@ -475,7 +499,7 @@ fn git_tristate(repo: &Path, args: &[&str]) -> Result<Option<String>, GitFail> {
     if out.status.code() == Some(1) {
         return Ok(None);
     }
-    Err(GitFail(format!("git {args:?}: {}", String::from_utf8_lossy(&out.stderr).trim())))
+    Err(GitFail(git_error(args, "failed", String::from_utf8_lossy(&out.stderr).trim())))
 }
 
 /// Run git where any non-zero exit is a failure. Exit 0 with empty output is a clean
@@ -483,9 +507,10 @@ fn git_tristate(repo: &Path, args: &[&str]) -> Result<Option<String>, GitFail> {
 fn git_strict(repo: &Path, args: &[&str]) -> Result<String, GitFail> {
     let out = run_git(repo, args)?;
     if !out.status.success() {
-        return Err(GitFail(format!(
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+        return Err(GitFail(git_error(
+            args,
+            "failed",
+            String::from_utf8_lossy(&out.stderr).trim(),
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1024,14 +1049,14 @@ fn remote_identity(
     let out = run_git(repo, &args)?;
     if out.status.success() {
         let url = std::str::from_utf8(&out.stdout)
-            .map_err(|_| GitFail(format!("git remote get-url {remote}: invalid UTF-8")))?;
+            .map_err(|e| GitFail(git_error(&args, "returned invalid UTF-8", e)))?;
         return Ok(classify_remote(url.trim(), hosts));
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     if stderr.to_lowercase().contains("no such remote") {
         return Ok(RepositoryIdentity::Missing);
     }
-    Err(GitFail(format!("git {args:?}: {}", stderr.trim())))
+    Err(GitFail(git_error(&args, "failed", stderr.trim())))
 }
 
 /// Peel `rev` to a commit object id. A leading `-` is not a
@@ -1277,12 +1302,13 @@ pub fn ahead_behind_oids(
     if git_tristate(repo, &["cat-file", "-e", other])?.is_none() {
         return Ok(None);
     }
-    let out =
-        git_strict(repo, &["rev-list", "--left-right", "--count", &format!("{local}...{other}")])?;
+    let range = format!("{local}...{other}");
+    let args = ["rev-list", "--left-right", "--count", range.as_str()];
+    let out = git_strict(repo, &args)?;
     let mut it = out.split_whitespace();
     let parse = |s: Option<&str>| {
         s.and_then(|v| v.parse().ok())
-            .ok_or_else(|| GitFail(format!("rev-list --left-right returned {out:?}")))
+            .ok_or_else(|| GitFail(git_error(&args, "returned unexpected output", out.trim())))
     };
     let ahead = parse(it.next())?;
     let behind = parse(it.next())?;
@@ -1291,7 +1317,20 @@ pub fn ahead_behind_oids(
 
 /// The merge-base commit of the resolved base OID and `HEAD`
 pub fn merge_base(repo: &Path, base_oid: &str) -> Option<String> {
-    git_line(repo, &["merge-base", base_oid, "HEAD"])
+    branch_merge_base(repo, base_oid).ok().flatten()
+}
+
+/// The branch diff's merge base. Exit 1 means the histories are unrelated; every other
+/// failure aborts the refresh so it cannot replace the last good world with an empty one.
+fn branch_merge_base(repo: &Path, base_oid: &str) -> Result<Option<String>> {
+    let args = ["merge-base", base_oid, "HEAD"];
+    let found = git_tristate(repo, &args).map_err(|e| anyhow::anyhow!(e.0))?;
+    match found {
+        Some(oid) if oid.is_empty() => {
+            bail!(git_error(&args, "returned unexpected output", "empty stdout"))
+        }
+        other => Ok(other),
+    }
 }
 
 /// The content of `path` at `rev` (`git show <rev>:<path>`). Empty when the path does
@@ -1395,18 +1434,19 @@ fn git_stdin(repo: &Path, args: &[&str], input: &str) -> Result<String, GitFail>
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| GitFail(format!("git {args:?}: {e}")))?;
+        .map_err(|e| GitFail(git_error(args, "could not run", e)))?;
     let mut stdin = child.stdin.take().expect("stdin piped");
     let owned = input.to_string();
     // A git that answers and exits before reading it all closes the pipe. That is its answer,
     // not a failure of ours, so the write's result is dropped and the exit status decides.
     let writer = std::thread::spawn(move || drop(stdin.write_all(owned.as_bytes())));
-    let out = child.wait_with_output().map_err(|e| GitFail(format!("git {args:?}: {e}")))?;
+    let out = child.wait_with_output().map_err(|e| GitFail(git_error(args, "could not run", e)))?;
     let _ = writer.join();
     if !out.status.success() {
-        return Err(GitFail(format!(
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+        return Err(GitFail(git_error(
+            args,
+            "failed",
+            String::from_utf8_lossy(&out.stderr).trim(),
         )));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -1474,9 +1514,9 @@ fn git_with_index(repo: &Path, index: &Path, args: &[&str]) -> Result<String> {
         .args(args)
         .env("GIT_INDEX_FILE", index)
         .output()
-        .with_context(|| format!("running git {args:?}"))?;
+        .map_err(|e| anyhow::anyhow!(git_error(args, "could not run", e)))?;
     if !out.status.success() {
-        bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        bail!(git_error(args, "failed", String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -1520,10 +1560,13 @@ pub fn changed_files(
             let base = diff_base(repo);
             worktree_diff(repo, &base)?
         }
-        Scope::Branch => match branch_base.and_then(|b| merge_base(repo, b)) {
-            Some(r) => worktree_diff(repo, &r)?,
-            None => return Ok(Vec::new()),
-        },
+        Scope::Branch => {
+            let Some(base) = branch_base else { return Ok(Vec::new()) };
+            match branch_merge_base(repo, base)? {
+                Some(r) => worktree_diff(repo, &r)?,
+                None => return Ok(Vec::new()),
+            }
+        }
         // `last-turn` and `commits` diff through their own entry points.
         Scope::LastTurn | Scope::Commits => return Ok(Vec::new()),
     };
@@ -2359,6 +2402,12 @@ mod tests {
             changes["a.rs"].old_oid, first_blob,
             "raw metadata remains pinned to the resolved endpoint"
         );
+    }
+
+    #[test]
+    fn a_git_error_names_the_subcommand_not_the_argv() {
+        assert_eq!(super::subcommand(&["-c", "x=y", "rev-parse", "--verify", "HEAD"]), "rev-parse");
+        assert_eq!(super::subcommand(&["for-each-ref"]), "for-each-ref");
     }
 
     #[test]

@@ -86,7 +86,8 @@ fn herdr(args: &[&str]) -> Result<String> {
         Ok(out) => out,
         Err(e) => {
             logln!("herdr {args:?} could not run: {e}");
-            bail!("herdr could not run");
+            // No herdr to ask is herdr not answering, whichever call it was.
+            return Err(Refusal::Unanswered.into());
         }
     };
     if !out.status.success() {
@@ -247,7 +248,7 @@ pub fn send_target() -> Result<SendTarget> {
             // A refusal is the whole status line, so it says the clipboard rather than herdr's
             // own wording. The cause is already in the log, with the argv `herdr` kept out of it.
             logln!("agent list failed: {e:#}");
-            bail!("herdr did not answer — copy to the clipboard instead")
+            return Err(Refusal::Unanswered.into());
         }
     };
     // Candidacy is decided once, here: an `agent` field, our workspace, not our own pane.
@@ -255,7 +256,7 @@ pub fn send_target() -> Result<SendTarget> {
     // tracking does not come through here: it asks where each agent works instead.
     let picked = candidates(&agents, ws.as_deref(), me.as_deref());
     match picked.len() {
-        0 => bail!("no agent here — copy to the clipboard instead"),
+        0 => Err(Refusal::NoAgent.into()),
         // The sole-agent send shows no row, so only the picker pays for the tab-label call.
         1 => Ok(SendTarget::One(picked[0].choice(&HashMap::new()))),
         _ => {
@@ -401,6 +402,72 @@ fn candidates<'a>(
         .collect()
 }
 
+/// Why a send went nowhere. Every comment stays. The app words the reviewer's line, since it
+/// knows the copy key to offer instead.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The named agent waits on a permission or confirm prompt.
+    AtPrompt(String),
+    /// herdr did not answer a call: it could not run, or could not list the agents.
+    Unanswered,
+    /// The workspace holds no agent to send to.
+    NoAgent,
+}
+
+/// The log's wording. The reviewer's line is the app's (`App::refusal_line`).
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::AtPrompt(name) => write!(f, "{name} is at a prompt"),
+            Refusal::Unanswered => write!(f, "herdr did not answer"),
+            Refusal::NoAgent => write!(f, "no agent in the workspace"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
+/// Whether an agent pane can take a send right now.
+#[derive(Debug, PartialEq, Eq)]
+enum Readiness {
+    /// The agent's input takes the paste.
+    Ready,
+    /// The agent is at a prompt. Holds its name, as the picker row shows it.
+    Busy(String),
+    /// The pane is no longer an agent herdr lists.
+    Gone,
+}
+
+/// Refuse a send to an agent at a prompt, read from a fresh `agent list` at the moment of
+/// sending: a prompt drops a paste, so the comments would never reach the input
+/// (`docs/herdr-api-notes.md`). The read and the send are two herdr calls, so an agent can
+/// still raise a prompt in between. herdr offers no atomic send-if-ready.
+pub fn ensure_ready(pane: &str) -> Result<()> {
+    let agents = match agent_list() {
+        Ok(agents) => agents,
+        Err(e) => {
+            logln!("agent list failed before the send: {e:#}");
+            return Err(Refusal::Unanswered.into());
+        }
+    };
+    match readiness_in(&agents, pane) {
+        Readiness::Ready => Ok(()),
+        Readiness::Busy(name) => Err(Refusal::AtPrompt(name).into()),
+        Readiness::Gone => bail!("agent pane {pane} is gone"),
+    }
+}
+
+/// Only an agent at a prompt refuses: a permission or confirm prompt drops a paste. A working
+/// agent takes typing mid-turn, and the paste waits in its input for the reviewer to submit,
+/// which is how a review reaches a running agent.
+fn readiness_in(agents: &[AgentPane], pane: &str) -> Readiness {
+    match agents.iter().find(|agent| agent.pane_id == pane && agent.agent.is_some()) {
+        None => Readiness::Gone,
+        Some(agent) if agent.status() == Status::Blocked => Readiness::Busy(agent.row_name()),
+        Some(_) => Readiness::Ready,
+    }
+}
+
 /// Write literal text into the agent pane's input, without submitting.
 ///
 /// Uses `pane send-text`, not the agent-level send: herdr 0.7.5 replaced `agent send` with
@@ -475,6 +542,32 @@ mod tests {
         tabs: &HashMap<String, String>,
     ) -> Vec<AgentChoice> {
         super::candidates(agents, ws, me).into_iter().map(|agent| agent.choice(tabs)).collect()
+    }
+
+    #[test]
+    fn a_send_refuses_only_an_agent_at_a_prompt() {
+        use super::Readiness::{Busy, Gone, Ready};
+        let at = |status: &str| AgentPane {
+            agent_status: status.into(),
+            state_labels: Some(HashMap::from([("compacting".into(), "Compacting".into())])),
+            ..agent("w8:p1", "w8:t1", "w8")
+        };
+        for (status, want) in [
+            ("idle", Ready),
+            ("done", Ready),
+            // A working agent takes typing mid-turn: the paste waits in its input.
+            ("working", Ready),
+            ("unknown", Ready),
+            ("compacting", Ready),
+            // A prompt drops a paste.
+            ("blocked", Busy("claude".into())),
+        ] {
+            assert_eq!(super::readiness_in(&[at(status)], "w8:p1"), want, "{status}");
+        }
+        assert_eq!(super::readiness_in(&[at("idle")], "w8:p9"), Gone);
+        // A pane whose agent exited is listed without one: the send goes nowhere near it.
+        let shell = AgentPane { agent: None, ..at("idle") };
+        assert_eq!(super::readiness_in(&[shell], "w8:p1"), Gone);
     }
 
     #[test]

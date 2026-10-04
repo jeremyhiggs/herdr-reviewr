@@ -66,9 +66,10 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 12] = [
+const PLUGIN_CONFIG_KEYS: [&str; 13] = [
     "theme",
     "default_scope",
+    "markdown_view",
     "navigator_position",
     "toggle_placement",
     "toggle_direction",
@@ -80,6 +81,23 @@ const PLUGIN_CONFIG_KEYS: [&str; 12] = [
     "url_opener",
     "keybindings",
 ];
+
+/// How a fresh pane shows a markdown file: as source, or rendered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MarkdownView {
+    #[default]
+    Source,
+    Rendered,
+}
+
+impl MarkdownView {
+    fn as_str(self) -> &'static str {
+        match self {
+            MarkdownView::Source => "source",
+            MarkdownView::Rendered => "rendered",
+        }
+    }
+}
 
 /// Where the navigator sits around the read pane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -160,6 +178,7 @@ impl ToggleDirection {
 pub struct PluginConfig {
     theme: String,
     default_scope: crate::model::Scope,
+    markdown_view: MarkdownView,
     navigator_position: NavigatorPosition,
     toggle_placement: TogglePlacement,
     toggle_direction: ToggleDirection,
@@ -177,6 +196,7 @@ impl Default for PluginConfig {
         Self {
             theme: crate::theme::DEFAULT.to_owned(),
             default_scope: crate::model::Scope::Uncommitted,
+            markdown_view: MarkdownView::Source,
             navigator_position: NavigatorPosition::Right,
             toggle_placement: TogglePlacement::Split,
             toggle_direction: ToggleDirection::Right,
@@ -200,6 +220,12 @@ impl PluginConfig {
     /// switches a running pane's scope.
     pub fn default_scope(&self) -> crate::model::Scope {
         self.default_scope
+    }
+
+    /// How a fresh pane shows markdown — startup and config recovery. A reread never flips a
+    /// running pane's view; `m` does.
+    pub fn markdown_view(&self) -> MarkdownView {
+        self.markdown_view
     }
 
     pub fn navigator_position(&self) -> NavigatorPosition {
@@ -267,6 +293,7 @@ impl PluginConfig {
         serde_json::json!({
             "theme": self.theme,
             "default_scope": self.default_scope.name(),
+            "markdown_view": self.markdown_view.as_str(),
             "navigator_position": self.navigator_position.as_str(),
             "toggle_placement": self.toggle_placement.as_str(),
             "toggle_direction": self.toggle_direction.as_str(),
@@ -355,10 +382,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     if let Some(value) = table.get("theme") {
         let theme = string_value(path, "theme", value, "a built-in theme name")?;
         if !crate::theme::is_known(theme) {
-            return Err(PluginConfigError::new(
-                path,
-                format!("invalid value for `theme`: {theme:?}; expected a built-in theme name"),
-            ));
+            return Err(value_error(path, value, "theme", "a built-in theme name"));
         }
         theme.clone_into(&mut config.theme);
     }
@@ -377,11 +401,27 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             _ => {
                 return Err(value_error(
                     path,
+                    value,
                     "default_scope",
                     "one of uncommitted, branch, last-turn",
                 ));
             }
         };
+    }
+    if let Some(value) = table.get("markdown_view") {
+        config.markdown_view =
+            match string_value(path, "markdown_view", value, "one of source, rendered")? {
+                "source" => MarkdownView::Source,
+                "rendered" => MarkdownView::Rendered,
+                _ => {
+                    return Err(value_error(
+                        path,
+                        value,
+                        "markdown_view",
+                        "one of source, rendered",
+                    ));
+                }
+            };
     }
     if let Some(value) = table.get("navigator_position") {
         config.navigator_position = match string_value(
@@ -397,6 +437,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             _ => {
                 return Err(value_error(
                     path,
+                    value,
                     "navigator_position",
                     "one of right, bottom, left, top",
                 ));
@@ -417,6 +458,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             _ => {
                 return Err(value_error(
                     path,
+                    value,
                     "toggle_placement",
                     "one of split, overlay, zoomed, tab",
                 ));
@@ -428,12 +470,14 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             match string_value(path, "toggle_direction", value, "one of right, down")? {
                 "right" => ToggleDirection::Right,
                 "down" => ToggleDirection::Down,
-                _ => return Err(value_error(path, "toggle_direction", "one of right, down")),
+                _ => {
+                    return Err(value_error(path, value, "toggle_direction", "one of right, down"));
+                }
             };
     }
     if let Some(value) = table.get("auto_open") {
         config.auto_open =
-            value.as_bool().ok_or_else(|| value_error(path, "auto_open", "a boolean"))?;
+            value.as_bool().ok_or_else(|| value_error(path, value, "auto_open", "a boolean"))?;
     }
     if let Some(value) = table.get("github_host") {
         config.github_host = Some(parse_forge_host(path, "github_host", value)?);
@@ -448,15 +492,11 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         let command = value
             .as_str()
             .filter(|c| !c.trim().is_empty())
-            .ok_or_else(|| value_error(path, "editor", "a non-empty command"))?;
+            .ok_or_else(|| value_error(path, value, "editor", "a non-empty command"))?;
         // `{file}` and `{line}` are the whole grammar, so a typo for one of them would
         // otherwise reach the editor as a literal word and open a file named after the typo
         if let Some(unknown) = unknown_placeholder(command, &["file", "line"]) {
-            return Err(value_error(
-                path,
-                "editor",
-                &format!("`{{file}}` and `{{line}}` as the only placeholders, not `{unknown}`"),
-            ));
+            return Err(placeholder_error(path, "editor", &unknown, "`{file}` and `{line}`"));
         }
         config.editor = Some(command.to_owned());
     }
@@ -464,18 +504,19 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         let command = value
             .as_str()
             .filter(|command| !command.trim().is_empty())
-            .ok_or_else(|| value_error(path, "url_opener", "a non-empty command"))?;
+            .ok_or_else(|| value_error(path, value, "url_opener", "a non-empty command"))?;
         if let Some(unknown) = unknown_placeholder(command, &["url"]) {
-            return Err(value_error(
-                path,
-                "url_opener",
-                &format!("`{{url}}` as the only placeholder, not `{unknown}`"),
-            ));
+            return Err(placeholder_error(path, "url_opener", &unknown, "`{url}`"));
         }
         // The program is the first word; it must name one, and never be the link itself.
         let program = crate::editor::split_command(command).into_iter().next();
         if program.as_deref().is_none_or(|p| p.is_empty() || p.contains("{url}")) {
-            return Err(value_error(path, "url_opener", "a command that names a program first"));
+            return Err(value_error(
+                path,
+                value,
+                "url_opener",
+                "a command that names a program first",
+            ));
         }
         config.url_opener = Some(command.to_owned());
     }
@@ -495,7 +536,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             return Err(PluginConfigError::new(
                 path,
                 format!(
-                    "invalid value for `{key}`; expected a hostname no other forge recognizes, but {value:?} is already `{owner}`"
+                    "invalid value for `{key}`: expected a hostname no other forge uses, not `{value}`, which is already `{owner}`"
                 ),
             ));
         }
@@ -543,7 +584,7 @@ fn parse_keybindings(
 ) -> Result<crate::keymap::Keymap, PluginConfigError> {
     use crate::keymap::{Action, Keymap};
     let Some(entries) = value.as_table() else {
-        return Err(value_error(path, "keybindings", "a table of action bindings"));
+        return Err(value_error(path, value, "keybindings", "a table of action bindings"));
     };
     let mut overrides = Vec::with_capacity(entries.len());
     let mut names_by_action = Vec::with_capacity(entries.len());
@@ -574,19 +615,19 @@ fn parse_keybindings(
         let entry_key = format!("keybindings.{name}");
         let expected = expected.as_str();
         let Some(values) = keys.as_array() else {
-            return Err(value_error(path, &entry_key, expected));
+            return Err(value_error(path, keys, &entry_key, expected));
         };
         if values.is_empty() {
-            return Err(value_error(path, &entry_key, expected));
+            return Err(value_error(path, keys, &entry_key, expected));
         }
         let mut keys = Vec::with_capacity(values.len());
         for value in values {
             let Some(text) = value.as_str() else {
-                return Err(value_error(path, &entry_key, expected));
+                return Err(value_error(path, value, &entry_key, expected));
             };
             match parse_key(text) {
                 Some(key) => keys.push(key),
-                None => return Err(value_error(path, &entry_key, expected)),
+                None => return Err(value_error(path, value, &entry_key, expected)),
             }
         }
         overrides.push((action, keys));
@@ -602,16 +643,34 @@ fn string_value<'a>(
     value: &'a toml::Value,
     expected: &str,
 ) -> Result<&'a str, PluginConfigError> {
-    value.as_str().ok_or_else(|| value_error(path, key, expected))
+    value.as_str().ok_or_else(|| value_error(path, value, key, expected))
 }
 
-fn value_error(path: &Path, key: &str, expected: &str) -> PluginConfigError {
-    PluginConfigError::new(path, format!("invalid value for `{key}`; expected {expected}"))
+/// The one invalid-value grammar: the key, what it takes, and what it was given, so the line
+/// says what to fix without opening the file.
+fn value_error(path: &Path, value: &toml::Value, key: &str, expected: &str) -> PluginConfigError {
+    // TOML's own spelling, so a string given where an array belongs reads as the string it is.
+    let given = value.to_string();
+    PluginConfigError::new(
+        path,
+        format!("invalid value for `{key}`: expected {expected}, not `{given}`"),
+    )
+}
+
+/// A command template naming a placeholder the key does not know: the typo, then the ones it
+/// does.
+fn placeholder_error(path: &Path, key: &str, unknown: &str, known: &str) -> PluginConfigError {
+    PluginConfigError::new(
+        path,
+        format!(
+            "invalid value for `{key}`: unknown placeholder `{unknown}`, expected only {known}"
+        ),
+    )
 }
 
 /// The one `CFG-WHOLE-FILE` unknown-key grammar, shared by the top-level table and `[keybindings]`.
 fn unknown_key_error(path: &Path, key: &str, options: &str) -> PluginConfigError {
-    PluginConfigError::new(path, format!("unknown key {key:?}; expected one of {options}"))
+    PluginConfigError::new(path, format!("unknown key `{key}`: expected one of {options}"))
 }
 
 /// The first `{` in `command` that opens neither `{file}` nor `{line}`.
@@ -647,7 +706,7 @@ fn parse_forge_host(
     let lower = host.to_ascii_lowercase();
     let built_in = crate::git::forge_for_host(&lower, &crate::git::ForgeHosts::default());
     if !valid_host_syntax(host) || built_in.is_some() {
-        return Err(value_error(path, key, expected));
+        return Err(value_error(path, value, key, expected));
     }
     Ok(lower)
 }
@@ -683,7 +742,9 @@ pub fn print_plugin_config() -> Result<(), PluginConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, NavigatorPosition, PluginConfig, ToggleDirection, TogglePlacement};
+    use super::{
+        Config, MarkdownView, NavigatorPosition, PluginConfig, ToggleDirection, TogglePlacement,
+    };
     use crate::keymap::KeyCode;
     use crate::model::Scope;
     use std::time::Duration;
@@ -757,6 +818,7 @@ mod tests {
         assert!(config.auto_open());
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
+        assert_eq!(config.markdown_view(), MarkdownView::Source);
     }
 
     #[test]
@@ -772,10 +834,12 @@ mod tests {
                 "toggle_direction = \"down\"\n",
                 "auto_open = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
+                "markdown_view = \"rendered\"\n",
             ),
         )
         .unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.markdown_view(), MarkdownView::Rendered);
         assert_eq!(config.theme(), "tokyo-night");
         assert_eq!(config.default_scope(), Scope::LastTurn);
         assert_eq!(config.navigator_position(), NavigatorPosition::Bottom);
@@ -828,13 +892,13 @@ mod tests {
         std::fs::write(&path, "theme = \"gruvbox\"\npoll = 500\n").unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains(path.to_str().unwrap()));
-        assert!(error.contains("unknown key \"poll\""));
+        assert!(error.contains("unknown key `poll`"));
 
         // The retired `base_branches` key fails like any unknown key: the base is a picked,
         // per-repo choice now, never configuration.
         std::fs::write(&path, "base_branches = [\"dev\"]\n").unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("unknown key \"base_branches\""));
+        assert!(error.contains("unknown key `base_branches`"));
 
         std::fs::write(&path, "theme = [\n").unwrap();
         assert!(
@@ -850,6 +914,8 @@ mod tests {
             ("default_scope = \"last turn\"\n", "`default_scope`"),
             // `commits` is never a start scope: the pane holds no pick yet.
             ("default_scope = \"commits\"\n", "`default_scope`"),
+            ("markdown_view = \"preview\"\n", "`markdown_view`"),
+            ("markdown_view = true\n", "`markdown_view`"),
             ("navigator_position = \"center\"\n", "`navigator_position`"),
             ("toggle_placement = \"left\"\n", "`toggle_placement`"),
             ("toggle_direction = \"left\"\n", "`toggle_direction`"),
@@ -884,7 +950,9 @@ mod tests {
             std::fs::write(&path, text).unwrap();
             let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
             assert!(error.contains(key), "{text}: {error}");
-            assert!(error.contains("expected"), "{text}: {error}");
+            // Every invalid value says what the key takes and what it was given.
+            let given = error.contains(", not `") || error.contains("unknown placeholder `");
+            assert!(error.contains("expected") && given, "{text}: {error}");
         }
     }
 
@@ -1089,11 +1157,11 @@ mod tests {
     #[test]
     fn a_new_default_collision_invalidates_the_resolved_keymap() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("config.toml"), "[keybindings]\npreview = [\"p\"]\n")
+        std::fs::write(dir.path().join("config.toml"), "[keybindings]\nrendered = [\"p\"]\n")
             .unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("`preview`") && error.contains("`navigator-position`"), "{error}");
-        assert!(error.contains("p is bound"), "{error}");
+        assert!(error.contains("`rendered`") && error.contains("`navigator-position`"), "{error}");
+        assert!(error.contains("`p` is bound"), "{error}");
     }
 
     #[test]
@@ -1139,7 +1207,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), "[keybindings]\nfoo = [\"x\"]\n").unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
-        assert!(error.contains("unknown key \"keybindings.foo\""), "{error}");
+        assert!(error.contains("unknown key `keybindings.foo`"), "{error}");
         assert!(error.contains("comment"), "the error lists the action names: {error}");
     }
 
@@ -1159,6 +1227,7 @@ mod tests {
         let object = value.as_object().unwrap();
         assert_eq!(object.len(), super::PLUGIN_CONFIG_KEYS.len(), "one JSON key per config key");
         assert_eq!(object["default_scope"], "uncommitted");
+        assert_eq!(object["markdown_view"], "source");
         assert_eq!(object["navigator_position"], "right");
         assert_eq!(object["toggle_placement"], "split");
         assert_eq!(object["toggle_direction"], "right");

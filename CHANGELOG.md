@@ -13,6 +13,49 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session-only and isolated between comparisons. Existing configurations that already bind `R`
   must move that binding or rebind `toggle-reviewed`, because duplicate bindings fail validation.
 
+## [0.43.0] — 2026-10-03
+
+### Changed
+- **Colors by meaning**: each theme focuses in its own accent, like herdr's frame, and every color reads on what sits behind it.
+  Running checks are yellow, like herdr's working dot.
+- **Rendered markdown takes the theme's heading and code colors**, per level in Catppuccin and Everforest, and inline code sits on a chip.
+
+### Fixed
+- **Line numbers and faint text are readable in every theme**, and tokyo-night-day shows its selection and diff tints.
+
+## [0.42.0] — 2026-10-02
+
+### Changed
+- **Clearer messages**: a refused send says why and how to get the comments out, and errors name what to fix.
+
+### Fixed
+- **`q` asks before dropping unsent comments**: `Q` drops them and quits. A config that binds `Q` must move `quit-discard`.
+  Thanks [@ruinshe](https://github.com/ruinshe) ([#119](https://github.com/persiyanov/herdr-reviewr/issues/119)).
+- **Send refuses an agent at a permission prompt**, which drops a paste, and keeps every comment.
+  Thanks [@stephenchristensen-caredotcom](https://github.com/stephenchristensen-caredotcom) ([#86](https://github.com/persiyanov/herdr-reviewr/issues/86)).
+
+## [0.41.0] — 2026-10-02
+
+### Added
+- **`ayu` theme**, ayu Dark with its own syntax colors.
+  Thanks [@r-darwish](https://github.com/r-darwish) ([#118](https://github.com/persiyanov/herdr-reviewr/pull/118)).
+- **`everforest` theme**, Everforest dark with the hard background.
+  Thanks [@snaggen](https://github.com/snaggen) ([#123](https://github.com/persiyanov/herdr-reviewr/pull/123)).
+
+## [0.40.1] — 2026-10-02
+
+### Fixed
+- **Install works with older curl**, such as on Red Hat 8 and CentOS 7.
+  Thanks [@chengdejerrylin](https://github.com/chengdejerrylin) ([#113](https://github.com/persiyanov/herdr-reviewr/pull/113)).
+- **PR comment ages honor the timestamp's time zone**: a time with an offset like `+02:00` no longer reads as UTC.
+  Thanks [@beefyhalo](https://github.com/beefyhalo) ([#122](https://github.com/persiyanov/herdr-reviewr/pull/122)).
+
+## [0.40.0] — 2026-10-02
+
+### Added
+- **Review markdown rendered**: comments, change marks and find. `m` flips every markdown file in the pane, and `markdown_view` opens it rendered.
+  Thanks [@kamadakohei](https://github.com/kamadakohei) ([#48](https://github.com/persiyanov/herdr-reviewr/issues/48)) and [@zereight](https://github.com/zereight) ([#103](https://github.com/persiyanov/herdr-reviewr/issues/103)) for asking.
+
 ## [0.39.0] — 2026-09-23
 
 ### Added

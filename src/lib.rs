@@ -25,8 +25,11 @@ pub mod keymap;
 #[macro_use]
 pub mod log;
 pub mod markdown;
+pub(crate) mod marks;
 pub mod model;
 pub mod proc;
+pub(crate) mod rendered;
+pub mod roles;
 pub mod search;
 pub mod selection;
 pub mod snippet;
@@ -241,11 +244,11 @@ fn run_editor(
         Ok(command) => command,
         // Two causes, and the second would otherwise be told to set what it set.
         Err(editor::NoEditor::Unset) => {
-            app.status = "set `editor` in the plugin config, or $EDITOR".into();
+            app.status = "no editor: set `editor` in the config, or $EDITOR".into();
             return Ok(());
         }
         Err(editor::NoEditor::NamesNoProgram) => {
-            app.status = "the editor setting names no program".into();
+            app.status = "the editor command names no program".into();
             return Ok(());
         }
     };
@@ -264,7 +267,7 @@ fn run_editor(
     // Asked before the pane changes hands: an editor that is not there would otherwise flip
     // the screen down to the shell and back for a spawn that never happened, on every press
     let Some(mut cmd) = proc::user_command(&command.program) else {
-        app.status = format!("no editor at {}", command.program);
+        app.status = format!("editor not found: {}", command.program);
         return Ok(());
     };
     cmd.args(&command.args).current_dir(&app.repo);
@@ -367,6 +370,7 @@ fn ready_app(cfg: &Config, plugin_config: PluginConfig) -> App {
         scope.name()
     );
     let mut app = App::new(repo, scope, cfg.base.clone());
+    app.seed_from_config(&plugin_config);
     app.set_plugin_config(plugin_config);
     app.set_cli_theme(cfg.theme.clone());
     if let Some(wrap) = cfg.wrap {
@@ -1006,6 +1010,9 @@ fn event_loop(
             } else {
                 viewport
             };
+            // Rendered markdown wraps to this frame's code column; a resize rebuilds it before
+            // the heights below measure it.
+            app.sync_rendered_width(ui::rendered_width(area, app));
             let heights = ui::diff_row_heights(app, area);
             if std::mem::take(&mut app.reveal_diff) || app.composing() {
                 app.reveal_diff_cursor(&heights, effective);
@@ -1403,19 +1410,34 @@ fn event_loop(
     result
 }
 
+/// A click or a wheel turn: the mouse events that answer the quit question.
+fn answers_question(kind: MouseEventKind) -> bool {
+    matches!(kind, MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+}
+
 /// A blocked frame accepts no normal input. Quit remains available, and terminal/pointer cleanup
 /// may release state that was captured before the config became invalid.
 fn handle_blocked_event(app: &mut App, event: &Event) {
     match event {
         Event::Key(k) if k.kind == KeyEventKind::Press => {
             // The blocked screen's escape hatch stays modifier-agnostic: a stuck user's `q` quits
-            // whatever the modifiers, exactly as before the keymap gained chords.
-            if let KeyCode::Char(c) = k.code
-                && keymap::default_keymap().action_for(keymap::Key::plain(c))
-                    == Some(keymap::Action::Quit)
-            {
-                app.should_quit = true;
+            // whatever the modifiers, exactly as before the keymap gained chords. Unsent comments
+            // survive the recovery, so with any queued it asks first, as on the review screen,
+            // minus send and copy, which the blocked screen does not offer.
+            let action = match k.code {
+                KeyCode::Char(c) => keymap::default_keymap().action_for(keymap::Key::plain(c)),
+                _ => None,
+            };
+            match (app.confirming_quit, action) {
+                (true, Some(keymap::Action::QuitDiscard)) => app.should_quit = true,
+                (true, Some(keymap::Action::Quit)) => {}
+                (true, _) => app.confirming_quit = false,
+                (false, Some(keymap::Action::Quit)) => app.request_quit(),
+                (false, _) => {}
             }
+        }
+        Event::Mouse(m) if app.confirming_quit && answers_question(m.kind) => {
+            app.confirming_quit = false;
         }
         Event::Mouse(MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), .. })
             if app.divider_drag_captured() =>
@@ -1639,8 +1661,16 @@ fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bo
 
 /// Map one key press onto `App` through `keymap` — the keymap of the frame on screen, so a
 /// stale hint never dispatches a different action than it advertised.
-/// Public for the dispatch tests; the event loop is the runtime caller.
+/// Public for the dispatch tests; the event loop is the runtime caller. Every input ends by
+/// settling the pick ([`App::settle_pick`]).
 pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Result<()> {
+    let done = dispatch_key(app, key, area, keymap);
+    app.settle_pick();
+    done
+}
+
+/// [`handle_key`]'s dispatch: the key's own action, its many early returns ahead of the tail.
+fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Result<()> {
     use crate::keymap::Action as K;
     use KeyCode::{Char, Down, Enter, Esc, Left, PageDown, PageUp, Right, Tab, Up};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1728,6 +1758,27 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     };
     let action = code.and_then(|code| keymap.action_for(crate::keymap::Key { ctrl, alt, code }));
 
+    // The quit question owns the keyboard until it is answered: `quit-discard` quits, `send` and
+    // `copy` deliver as they always do, and every other key, `esc` included, only answers. The
+    // quit key leaves it open, so a held `q`'s auto-repeat (a plain press without the kitty
+    // event-type flag) can never answer the question it raised.
+    if app.confirming_quit {
+        match action {
+            Some(K::QuitDiscard) => app.should_quit = true,
+            Some(K::Quit) => {}
+            Some(K::Send) => {
+                app.confirming_quit = false;
+                app.send_to_agent();
+            }
+            Some(K::Copy) => {
+                app.confirming_quit = false;
+                app.export(&Clipboard);
+            }
+            _ => app.confirming_quit = false,
+        }
+        return Ok(());
+    }
+
     // An armed crossing waits for a repeat of the hunk step that armed it. Every other key drops
     // it, and still does its own work. The steps themselves settle their arm in
     // `step_hunk`, which is what makes the other direction disarm too. `esc` is exempt: the `esc`
@@ -1809,7 +1860,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
     // The read-only PR tab: navigate the snapshot and open links; authoring actions are inert.
     if app.tab == crate::app::Tab::Pr {
         match (action, key.code) {
-            (Some(K::Quit), _) => app.should_quit = true,
+            (Some(K::Quit), _) => app.request_quit(),
             (Some(K::Refresh), _) => {
                 app.request_pr_refresh(crate::app::RefreshKind::Forced);
                 app.refresh_commanded = true;
@@ -1857,7 +1908,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
 
     if let Some(action) = action {
         match action {
-            K::Quit => app.should_quit = true,
+            K::Quit => app.request_quit(),
             K::Refresh => {
                 app.request_world_refresh(false, false);
                 app.refresh_commanded = true;
@@ -1888,7 +1939,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::NextFile => app.next_file(),
             K::PrevFile => app.prev_file(),
             K::Wrap => app.toggle_wrap(),
-            K::Preview => app.toggle_preview(),
+            K::Rendered => app.toggle_rendered(),
             K::NavigatorPosition => app.cycle_navigator_position(),
             K::NavigatorHide => app.toggle_navigator_hidden(),
             K::NavigatorGrow => app.resize_navigator(4),
@@ -1920,8 +1971,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> 
             K::Find => app.open_find(),
             K::Keys => app.toggle_keys(),
             // `delete` off the diff and `open-pr` off the `PR` tab are inert. `edit` is not:
-            // it reaches the navigator's file rows too.
-            K::Delete | K::OpenPr => {}
+            // it reaches the navigator's file rows too. `quit-discard` only answers the quit
+            // question, above.
+            K::Delete | K::OpenPr | K::QuitDiscard => {}
         }
         return Ok(());
     }
@@ -1954,7 +2006,7 @@ fn handle_text_down(app: &mut App, m: MouseEvent, area: Rect) -> bool {
     use crate::selection::{Gesture, Point, Surface, TextDrag};
     let file_tab = app.tab != crate::app::Tab::Pr;
     let arm = |app: &mut App, surface: Surface, point: Point| {
-        let count = app.note_click(m.column, m.row, point.row);
+        let count = app.note_click(m.column, m.row, point.row, surface);
         app.gesture =
             Gesture::Text { drag: TextDrag { surface, anchor: point, extent: point }, count };
     };
@@ -2034,11 +2086,7 @@ fn text_drag_edge_scroll(app: &mut App, m: MouseEvent, area: Rect) {
             let Some(rect) = ui::painted_sel(app, area).map(|s| s.rect) else { return };
             let delta = edge_delta(m.row, rect);
             if rect.height > 0 && delta != 0 {
-                if app.tab == crate::app::Tab::Pr {
-                    app.pr_scroll_read(delta);
-                } else {
-                    app.wheel_diff(delta); // the preview's scroll path
-                }
+                app.pr_scroll_read(delta);
             }
         }
         Surface::PrNav => {
@@ -2095,7 +2143,8 @@ fn read_edge_scroll(app: &mut App, m: MouseEvent, area: Rect, horizontal: bool) 
         // The same event's extent update maps against the post-scroll layout.
         ui::refresh_read_layout(app, area);
     }
-    if horizontal && !app.wrap {
+    // Rendered markdown never scrolls sideways, so its drag leaves the source's offset alone.
+    if horizontal && !app.wrap && !app.rendered_active() {
         if m.column < content.x {
             app.h_scroll = app.h_scroll.saturating_sub(2);
         } else if m.column >= content.x + content.width {
@@ -2329,11 +2378,11 @@ fn perform_click(
             if let Some(url) = app.painted_link_at(m.column, m.row) {
                 app.focus = Focus::Diff;
                 app.open_link(&url);
-            } else if let Some(summary) = app.painted_details_at(m.column, m.row) {
+            } else if let Some(key) = app.painted_details_at(m.column, m.row) {
                 app.focus = Focus::Diff;
-                app.toggle_details(&summary);
-            } else if app.tab == crate::app::Tab::Pr || app.preview_active() {
-                // The painted surfaces have no cursor: a click only focuses the pane.
+                app.toggle_details(&key);
+            } else if app.tab == crate::app::Tab::Pr {
+                // The painted surface has no cursor: a click only focuses the pane.
                 if ui::in_diff_pane(area, app, m.column, m.row) {
                     app.focus = Focus::Diff;
                 }
@@ -2343,6 +2392,10 @@ fn perform_click(
                 app.focus = Focus::Diff;
                 app.diff_cursor = i;
                 app.select_anchor = None;
+                // A click on a card picks its comment, for the `edit`/`delete` that follow.
+                if let Surface::Card { comment } = drag.surface {
+                    app.target_comment_card(comment);
+                }
                 app.expand_fold(heights, ui::diff_viewport_height(area, app));
             }
         }
@@ -2361,7 +2414,29 @@ pub fn handle_mouse(
     keymap: &Keymap,
     target: &dyn crate::export::ExportTarget,
 ) -> Result<()> {
+    let done = dispatch_mouse(app, m, area, heights, keymap, target);
+    app.settle_pick();
+    done
+}
+
+/// [`handle_mouse`]'s dispatch: the event's own action, its many early returns ahead of the
+/// tail.
+fn dispatch_mouse(
+    app: &mut App,
+    m: MouseEvent,
+    area: Rect,
+    heights: &[usize],
+    keymap: &Keymap,
+    target: &dyn crate::export::ExportTarget,
+) -> Result<()> {
     app.hover = Some((m.column, m.row));
+    // A click or a wheel answers the quit question and does nothing else, like a key that is
+    // not one of its answers. Motion, a drag, and a release are no answer, so a gesture that
+    // was under way finishes as it would have.
+    if app.confirming_quit && answers_question(m.kind) {
+        app.confirming_quit = false;
+        return Ok(());
+    }
     // Pointer motion with no button held, or a fresh mouse-down, proves an active gesture's
     // release was lost — herdr routes mouse by pointer position, so a release over another
     // pane never arrives here. The proof completes the old gesture (a visible selection
@@ -2587,15 +2662,8 @@ pub fn handle_mouse(
                 // composer opens on release.
                 app.start_gutter_drag(row);
             } else if handle_text_down(app, m, area) {
-                // A pending click or text drag armed. Every painted preview cell is claimed
+                // A pending click or text drag armed. Every painted text cell is claimed
                 // here, so link opens live in `perform_click`, at the release
-            } else if app.preview_active() {
-                // A preview click only focuses the pane. The pane-rect test, not the
-                // source-row hit test — the rendered preview can be taller than the
-                // source has rows.
-                if ui::in_diff_pane(area, app, m.column, m.row) {
-                    app.focus = Focus::Diff;
-                }
             } else if let Some(i) =
                 ui::hit_diff(area, app, m.column, m.row, heights, app.diff_scroll)
             {
@@ -2603,6 +2671,9 @@ pub fn handle_mouse(
                 app.focus = Focus::Diff;
                 app.diff_cursor = i;
                 app.select_anchor = None;
+                if let Some(comment) = ui::card_at(area, app, m.column, m.row) {
+                    app.target_comment_card(comment);
+                }
                 // A click on a fold marker expands it, keeping the viewport still.
                 app.expand_fold(heights, ui::diff_viewport_height(area, app));
             }
@@ -2946,8 +3017,54 @@ mod refresh_tests {
         );
         assert!(!app.divider_drag_cancelled());
 
+        // The frozen draft is unsent, so `q` asks and `Q` quits.
         handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Char('q'))));
+        assert!(app.confirming_quit && !app.should_quit);
+        handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Char('Q'))));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn the_blocked_screen_asks_before_dropping_unsent_comments() {
+        let mut app = App::new(std::path::PathBuf::from("."), Scope::Uncommitted, None);
+        app.store.add(crate::model::Comment {
+            file: "a.rs".into(),
+            side: crate::model::Side::New,
+            start: 1,
+            end: 1,
+            lines: "+a".into(),
+            text: "keep".into(),
+            diff_anchored: true,
+            rev: crate::model::Rev::Worktree,
+        });
+        app.set_config_error("invalid config".to_string());
+        let q = Event::Key(KeyEvent::from(KeyCode::Char('q')));
+        handle_blocked_event(&mut app, &q);
+        assert!(app.confirming_quit && !app.should_quit, "the first `q` asks");
+        handle_blocked_event(&mut app, &q);
+        assert!(app.confirming_quit && !app.should_quit, "a repeated `q` never answers");
+        handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Esc)));
+        assert!(!app.confirming_quit && !app.should_quit, "any other key answers and stays");
+        handle_blocked_event(&mut app, &q);
+        let click = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        handle_blocked_event(&mut app, &click);
+        assert!(!app.confirming_quit && !app.should_quit, "a click answers and stays");
+        handle_blocked_event(&mut app, &q);
+        handle_blocked_event(&mut app, &Event::Key(KeyEvent::from(KeyCode::Char('Q'))));
+        assert!(app.should_quit, "asked, `Q` quits");
+
+        // A draft frozen under the error screen is unsent too, so its quit asks first.
+        let mut app = App::new(std::path::PathBuf::from("."), Scope::Uncommitted, None);
+        app.mode = crate::app::Mode::Composing { editing: None };
+        app.input = "half a thought".to_string();
+        app.set_config_error("invalid config".to_string());
+        handle_blocked_event(&mut app, &q);
+        assert!(app.confirming_quit && !app.should_quit, "a draft makes `q` ask");
     }
 
     #[test]

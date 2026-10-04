@@ -41,12 +41,13 @@ pub trait ExportTarget {
     fn label(&self) -> &'static str;
     /// Destination-specific confirmation shown after a successful export.
     fn success_message(&self, count: usize) -> String;
-    /// Destination-specific line shown after a failed one. It is the whole status, so it is one
-    /// short sentence a reviewer can read, never the underlying error. The cause goes to the log.
-    fn failure_message(&self) -> String;
+    /// Destination-specific line shown after a failed one, given the error [`Self::export`]
+    /// returned. It is the whole status, so it is one short sentence a reviewer can read, never
+    /// the underlying error. The cause goes to the log.
+    fn failure_message(&self, error: &anyhow::Error) -> String;
 }
 
-fn counted_comments(count: usize) -> String {
+pub(crate) fn counted_comments(count: usize) -> String {
     let noun = if count == 1 { "comment" } else { "comments" };
     format!("{count} {noun}")
 }
@@ -61,6 +62,18 @@ const CLIPBOARD_TOOLS: &[(&str, &[&str])] = &[
     ("xsel", &["--clipboard", "--input"]),
 ];
 
+/// No clipboard tool on `PATH`: the one copy failure the reviewer can fix, so its line says how.
+#[derive(Debug)]
+struct NoClipboardTool;
+
+impl std::fmt::Display for NoClipboardTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "no clipboard tool found (wl-clipboard, xclip, or xsel)")
+    }
+}
+
+impl std::error::Error for NoClipboardTool {}
+
 /// The system clipboard, via the first available platform clipboard tool.
 #[derive(Debug)]
 pub struct Clipboard;
@@ -74,15 +87,17 @@ impl ExportTarget for Clipboard {
         format!("copied {}", counted_comments(count))
     }
 
-    fn failure_message(&self) -> String {
-        "clipboard failed".to_string()
+    fn failure_message(&self, error: &anyhow::Error) -> String {
+        if error.is::<NoClipboardTool>() {
+            "copy failed: install wl-clipboard, xclip, or xsel".to_string()
+        } else {
+            "copy failed".to_string()
+        }
     }
 
     fn export(&self, text: &str) -> Result<()> {
-        let (cmd, args) = select_tool(CLIPBOARD_TOOLS, crate::proc::on_path).context(
-            "no clipboard tool found (install wl-clipboard, xclip, or xsel) — \
-             use Send instead",
-        )?;
+        let (cmd, args) =
+            select_tool(CLIPBOARD_TOOLS, crate::proc::on_path).ok_or(NoClipboardTool)?;
         let mut child = crate::proc::command(cmd)
             .args(args)
             .stdin(Stdio::piped())
@@ -128,17 +143,21 @@ impl ExportTarget for Agent {
     /// Names the agent it addressed. The send is irreversible and consumes the whole set, so
     /// this line is the reviewer's only record of where the review went.
     fn success_message(&self, count: usize) -> String {
-        format!("added {} to {}", counted_comments(count), self.name)
+        format!("sent {} to {}", counted_comments(count), self.name)
     }
 
-    /// The pane was resolved before the send and closed in between, which is the only way this
-    /// happens in practice. herdr's own wording is a JSON envelope around a pane id, so the
-    /// reviewer gets this instead and the payload goes to the log.
-    fn failure_message(&self) -> String {
-        "agent not found".to_string()
+    /// herdr ran and refused the paste: the pane closed after it was resolved. herdr's own
+    /// wording is a JSON envelope around a pane id, so the reviewer gets a sentence and the
+    /// payload goes to the log. A [`herdr::Refusal`], a herdr that never answered included,
+    /// never reaches here: the app words it.
+    fn failure_message(&self, _error: &anyhow::Error) -> String {
+        format!("{} closed", self.name)
     }
 
+    /// An agent at a prompt refuses the send ([`herdr::ensure_ready`]). The state is
+    /// read here, at the moment of sending, because the picker's rows can be minutes old.
     fn export(&self, text: &str) -> Result<()> {
+        herdr::ensure_ready(&self.pane)?;
         herdr::send_text(&self.pane, text)?;
         // Focus is a convenience once the text is delivered; a focus failure must NOT fail the
         // export, or the comments stay unconsumed and the next Send duplicates the whole review.
@@ -175,10 +194,25 @@ mod tests {
         // The agent line names the pane it addressed, so a mis-send is visible the moment it
         // lands.
         let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
-        assert_eq!(agent.success_message(1), "added 1 comment to release-bot");
-        assert_eq!(agent.success_message(2), "added 2 comments to release-bot");
+        assert_eq!(agent.success_message(1), "sent 1 comment to release-bot");
+        assert_eq!(agent.success_message(2), "sent 2 comments to release-bot");
         assert_eq!(Clipboard.success_message(1), "copied 1 comment");
         assert_eq!(Clipboard.success_message(2), "copied 2 comments");
+    }
+
+    #[test]
+    fn a_failed_send_or_copy_says_what_to_do() {
+        let agent = Agent { pane: "w8:p1".into(), name: "release-bot".into() };
+        assert_eq!(agent.failure_message(&anyhow::anyhow!("herdr refused")), "release-bot closed");
+        let missing = anyhow::Error::from(super::NoClipboardTool);
+        assert_eq!(
+            Clipboard.failure_message(&missing),
+            "copy failed: install wl-clipboard, xclip, or xsel"
+        );
+        assert_eq!(
+            Clipboard.failure_message(&anyhow::anyhow!("pbcopy exited non-zero")),
+            "copy failed"
+        );
     }
 
     fn comment(file: &str, side: Side, start: u32, end: u32, lines: &str, text: &str) -> Comment {

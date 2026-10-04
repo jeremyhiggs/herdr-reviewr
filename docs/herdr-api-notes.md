@@ -192,6 +192,16 @@ ordinal. The picker joins `label` on `tab_id`, best effort.
 `herdr tab rename <tab_id> <label>` sets a tab's `label` (0.7.5). A `tab`-placement open uses it to
 name the fresh tab `reviewr`.
 
+Right before writing, the send reads `agent list` again and refuses only a `blocked` agent.
+Verified on Claude Code 2.1.287 with the same bracketed paste reviewr sends:
+- **At a permission prompt (`blocked`)**, the paste is silently dropped. The prompt ignores it,
+  nothing is approved, and the input is empty once the prompt closes, whether cancelled or approved.
+- **Mid-turn (`working`)**, the paste lands in the input as `[Pasted text #N]` and stays there
+  after the turn ends, for the reviewer to submit.
+
+So every other `agent_status` sends, `working` included. On 0.8.2, `agent list` answers in under
+10 ms. The read and the write are two calls, and herdr has no atomic send-if-ready.
+
 ```
 herdr pane send-text <agent_pane> "<literal text>"   # writes input, no Enter
 herdr agent focus    <agent_pane>                    # focus so the reviewer submits

@@ -1,6 +1,6 @@
 [package]
 name = "herdr-reviewr"
-version = "0.39.0"
+version = "0.43.0"
 edition = "2024"
 rust-version = "1.97"
 description = "A terminal review pane for herdr: browse an agent's changes and send comments back to chat."
@@ -19,6 +19,9 @@ fff-search = "0.11.0"
 # The matcher fff-search scores with: the base picker ranks branch names by the same rule
 # as the search screen, over a plain string list.
 neo_frizbee = "0.13.3"
+# Pinned in the lockfile through ratatui's optional `palette` feature. WCAG contrast and OKLab
+# for the color roles, instead of hand-rolled matrices.
+palette = { version = "0.7.7", default-features = false, features = ["std"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +30,8 @@ similar = { version = "3.2.0", features = ["text"] }
 # Dumps + fancy-regex only: no yaml-load (we read prebuilt binary syntax dumps, so the
 # unmaintained yaml-rust never enters the tree), no onig (pure-Rust regex engine).
 syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy", "dump-load", "plist-load"] }
+# Already in the tree through ratatui's calendar widget. Parses RFC 3339 forge timestamps.
+time = { version = "0.3", features = ["parsing"] }
 toml = "1.1"
 two-face = "0.5.2"
 unicode-width = "0.2"

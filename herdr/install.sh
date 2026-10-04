@@ -10,6 +10,8 @@
 set -euo pipefail
 
 NAME="herdr-reviewr"
+# Every line this step prints starts with the plugin's name, as the pane script's lines do.
+SAY="reviewr"
 REPO="persiyanov/herdr-reviewr"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,7 +30,7 @@ case "$os-$arch" in
   Linux-aarch64 | Linux-arm64) target="aarch64-unknown-linux-musl" ;;
   Linux-x86_64)              target="x86_64-unknown-linux-musl" ;;
   *)
-    echo "$NAME: no prebuilt binary for $os-$arch — build from source with 'cargo install --path .'" >&2
+    echo "$SAY: no prebuilt binary for $os-$arch, build from source with 'cargo install --path .'" >&2
     exit 1
     ;;
 esac
@@ -42,15 +44,21 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 # Release-asset downloads are eventually-consistent: GitHub's CDN can 404 for a few minutes
-# after a release publishes, even though the asset exists. Retry (incl. on 404) so an install
-# right after a release doesn't fail spuriously.
-dl() { curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors --retry-connrefused "$1" -o "$2"; }
+# after a release publishes, even though the asset exists. Retry every failure, 404 included,
+# in the shell rather than with curl's retry flags, which older curls (RHEL 8, CentOS 7) lack.
+dl() {
+  for _ in 1 2 3 4 5 6; do
+    curl -fsSL "$1" -o "$2" && return
+    sleep 3
+  done
+  return 1
+}
 
-echo "$NAME: downloading $archive ($TAG)"
+echo "$SAY: downloading $archive ($TAG)"
 dl "$base/$archive" "$tmp/$archive"
 dl "$base/$checksum" "$tmp/$checksum"
 
-echo "$NAME: verifying checksum"
+echo "$SAY: verifying checksum"
 expected="$(awk '{print $1}' "$tmp/$checksum")"
 if command -v sha256sum >/dev/null 2>&1; then
   actual="$(sha256sum "$tmp/$archive" | awk '{print $1}')"
@@ -58,14 +66,14 @@ else
   actual="$(shasum -a 256 "$tmp/$archive" | awk '{print $1}')"
 fi
 if [ "$expected" != "$actual" ]; then
-  echo "$NAME: checksum mismatch (expected $expected, got $actual)" >&2
+  echo "$SAY: checksum mismatch (expected $expected, got $actual)" >&2
   exit 1
 fi
 
 mkdir -p "$BIN_DIR"
 tar -xzf "$tmp/$archive" -C "$tmp"
 install -m 0755 "$tmp/$NAME" "$BIN_DIR/$NAME"
-echo "$NAME: installed $BIN_DIR/$NAME"
+echo "$SAY: installed $BIN_DIR/$NAME"
 
 # Stable launch paths: symlinks into the installed
 # plugin, never copies, so a launch after an uninstall fails loudly instead of running a
@@ -80,9 +88,9 @@ LINK_ROOT="${HERDR_PLUGIN_ROOT:-$ROOT}"
 link_binary() {
   if mkdir -p "$1" 2>/dev/null && { [ -L "$1/$NAME" ] || [ ! -e "$1/$NAME" ]; } &&
     ln -sfn "$LINK_ROOT/bin/$NAME" "$1/$NAME" 2>/dev/null; then
-    echo "$NAME: linked $1/$NAME"
+    echo "$SAY: linked $1/$NAME"
   else
-    echo "$NAME: warning: could not link $1/$NAME" >&2
+    echo "$SAY: warning: could not link $1/$NAME" >&2
   fi
 }
 link_binary "$HOME/.local/state/herdr/plugins/persiyanov.reviewr/bin"
