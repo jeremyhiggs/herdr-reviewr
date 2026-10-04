@@ -383,8 +383,8 @@ pub enum Mode {
     /// The search screen, replacing the body from any tab. Its state
     /// lives in [`App::search`].
     Search,
-    /// The in-file find band over the read pane. Its state lives in
-    /// [`App::find`].
+    /// The band at the read pane's foot: find in the file, or a line number to jump to. Its
+    /// state lives in [`App::find`].
     Find,
 }
 
@@ -497,23 +497,36 @@ pub enum PickedResult<'a> {
     Code(&'a crate::search::CodeHit),
 }
 
-/// The in-file find band's state while `mode == Mode::Find`. The current
-/// match is the read-pane cursor when its row matches, so only the query is stored — the matches,
-/// count, and highlight all derive from the query against the open file each frame.
+/// The band at the read pane's foot while `mode == Mode::Find`: find in the file, or the line
+/// field. Find stores only its query — matches, count and highlight derive from it against the
+/// open file each frame.
 #[derive(Clone, Debug, Default)]
 pub struct Find {
+    /// What the band asks for: text to find, or a line to jump to.
+    pub kind: BandKind,
     pub query: String,
     /// The caret into `query`: a char index, edited by the shared caret ops.
     pub caret: usize,
+}
+
+/// What the band at the read pane's foot asks for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BandKind {
+    /// `ctrl+f`: text, stepped through match by match.
+    #[default]
+    Text,
+    /// `:`: a line number, jumped to on Enter, in the file it opened over — another file or tab
+    /// closes it.
+    Line,
 }
 
 /// A found match in file order: how the cursor moves onto it.
 enum FindHit {
     /// A visible row, at this `visible` index.
     Visible(usize),
-    /// A row hidden in the collapsed fold `anchor`; `new_no` is its context line, unique within
-    /// the fold, so it is found again once the fold expands.
-    Folded { anchor: u32, new_no: u32 },
+    /// A row hidden in a collapsed fold; `new_no` is its context line, which lands on it once
+    /// the fold opens.
+    Folded { new_no: u32 },
 }
 
 /// The char-index ranges of every non-overlapping occurrence of `query` in `text`, honoring
@@ -582,6 +595,10 @@ pub enum FooterAction {
     /// The find band's own bar: step between matches, and close.
     FindStep,
     CloseFind,
+    /// Open the line field — offered wherever find is.
+    GotoLine,
+    /// The line field's own bar: jump to the typed line.
+    LineGo,
     /// Switch focus between the file list and the diff; the label names the destination pane.
     TogglePane,
     /// Flip a markdown file between rendered and source; the label names the destination
@@ -707,6 +724,9 @@ pub struct App {
     /// Set by a navigation that moves `diff_cursor`; consumed once per frame to scroll the
     /// cursor into view. The wheel never sets it.
     pub reveal_diff: bool,
+    /// Set by a jump to a named line (`goto_line`): consumed with `reveal_diff`, it centers the
+    /// cursor when it landed off screen instead of nudging it to the nearest edge.
+    pub reveal_center: bool,
     /// The file crossing a hunk step armed when it found no further hunk in the open file. The
     /// next step the same way takes it, and any other input drops it.
     armed_cross: Option<ArmedCross>,
@@ -874,7 +894,7 @@ pub struct App {
     /// An `edit` press that named a file. The event loop runs the editor, suspending the pane
     /// first only for one that draws there. `None` when idle.
     pub editor_request: Option<EditTarget>,
-    /// The in-file find band's state while `mode == Mode::Find`, `None` otherwise
+    /// The band's state — find or the line field — while `mode == Mode::Find`, `None` otherwise
     pub find: Option<Find>,
     /// Whether the tab-strip glyph paints this frame — maintained by the event loop's
     /// appear-delay and minimum-display clocks.
@@ -979,6 +999,7 @@ impl App {
             file_scroll: 0,
             reveal_files: false,
             reveal_diff: false,
+            reveal_center: false,
             armed_cross: None,
             resume_list: false,
             toggled_dirs: HashSet::new(),
@@ -1682,6 +1703,10 @@ impl App {
     /// rows of the file being left are dropped first, so no place or mark is carried from one
     /// file to another.
     fn open_fresh(&mut self) {
+        // Find follows the reviewer across files; the line field was typed for the one left.
+        if self.line_open() {
+            self.close_find();
+        }
         self.rendered.details.clear();
         self.rendered.built = None;
         self.rendered.drop_rows();
@@ -1754,7 +1779,7 @@ impl App {
                 if rendered {
                     self.rendered.index.row_at_line(line)
                 } else {
-                    Some(source_row_of(&self.visible, line))
+                    Some(line_row(&self.visible, line, Row::new_no))
                 }
             };
             if let Some(i) = to(cursor) {
@@ -2534,11 +2559,7 @@ impl App {
             if !self.rendered_active() {
                 return; // only a painted disclosure takes the click
             }
-            let open = self
-                .rendered
-                .built
-                .as_ref()
-                .is_some_and(|b| b.input.details.iter().any(|k| k == key));
+            let open = self.details_open(key);
             self.rendered.details.insert(key.to_string(), !open);
         }
         if self.rendered_active() {
@@ -2777,6 +2798,42 @@ impl App {
         self.diff_scroll = keep_in_view(target, self.diff_scroll, heights, viewport);
     }
 
+    /// Center the cursor's row in the read pane when it sits off screen; leave the scroll when
+    /// it is already in view. Row heights decide both, so a wrapped row counts its full height.
+    pub fn center_diff_cursor(&mut self, heights: &[usize], viewport: usize) {
+        if heights.is_empty() || viewport == 0 {
+            return;
+        }
+        let target = self.diff_cursor.min(heights.len() - 1);
+        let in_view = self.diff_scroll <= target
+            && heights[self.diff_scroll..=target].iter().sum::<usize>() <= viewport;
+        if in_view {
+            return;
+        }
+        // Rows above the target fill about half of what the target leaves of the pane.
+        let room = viewport.saturating_sub(heights[target]) / 2;
+        let mut top = target;
+        let mut above = 0;
+        while top > 0 && above + heights[top - 1] <= room {
+            top -= 1;
+            above += heights[top];
+        }
+        self.diff_scroll = top;
+    }
+
+    /// Settle the read pane's scroll for this frame: a jump to a named line centers, any other
+    /// navigation (or an open composer) nudges the cursor into view, then the offset bounds. A
+    /// center consumes a nudge asked in the same event, which would pin the line to the edge.
+    pub fn settle_diff_scroll(&mut self, heights: &[usize], viewport: usize) {
+        let nudge = std::mem::take(&mut self.reveal_diff);
+        if std::mem::take(&mut self.reveal_center) {
+            self.center_diff_cursor(heights, viewport);
+        } else if nudge || self.composing() {
+            self.reveal_diff_cursor(heights, viewport);
+        }
+        self.bound_diff_scroll(heights, viewport);
+    }
+
     /// Clamp `diff_scroll` within range (no blank tail). Called every frame. Height-aware:
     /// the cap is the offset that shows the LAST row at the bottom — computed from `heights`,
     /// not the row count, so a wrapped diff (tall rows) stays fully reachable. A row-count cap
@@ -2895,6 +2952,10 @@ impl App {
         self.ensure_config_ready()?;
         if self.tab == tab || self.composing() {
             return Ok(());
+        }
+        // The line field was typed for the tab it opened over; the PR tab draws no band at all.
+        if self.line_open() || (tab == Tab::Pr && self.mode == Mode::Find) {
+            self.close_find();
         }
         self.tab = tab;
         // Entering the PR tab leaves the file tabs frozen in place and fetches the PR. A
@@ -4070,8 +4131,12 @@ impl App {
     /// Insert pasted `text` at the caret as one unit, normalizing `\r\n`/`\r` to `\n`. The
     /// single-line search and find queries take a newline as a space; the
     /// base picker's filter drops it, so a branch name pasted with the newline it was copied
-    /// with still matches its branch.
+    /// with still matches its branch. The line field takes a number or `$` from it instead.
     pub fn input_paste(&mut self, text: &str) {
+        if self.line_open() {
+            self.paste_line(text);
+            return;
+        }
         let mut norm = text.replace("\r\n", "\n").replace('\r', "\n");
         match self.mode {
             Mode::Search | Mode::Find => norm = norm.replace('\n', " "),
@@ -4677,9 +4742,9 @@ impl App {
         self.search_dirty = false;
     }
 
-    /// Whether the find band opens: the read pane shows searchable content rows — a file tab, not
-    /// not rendered markdown, at least one content row. A notice (binary, too large) and an
-    /// empty file carry no content rows, so `any(is_content)` excludes them.
+    /// Whether the band opens, find or the line field: a file tab whose read pane shows content
+    /// rows, source or rendered. A notice (binary, too large) and an empty file carry no content
+    /// rows, so `any(is_content)` excludes them.
     pub fn find_available(&self) -> bool {
         self.tab.is_file_tab() && self.visible.iter().any(Row::is_content)
     }
@@ -4701,12 +4766,156 @@ impl App {
         self.reveal_diff = true;
     }
 
+    /// `:`: open the line field in the band's place, wherever find opens, over the open file.
+    /// Nothing moves until Enter ([`App::line_go`]).
+    pub fn open_line(&mut self) {
+        self.open_find();
+        if let Some(f) = self.find.as_mut() {
+            f.kind = BandKind::Line;
+        }
+    }
+
+    /// Whether the band open is the line field.
+    pub fn line_open(&self) -> bool {
+        self.mode == Mode::Find && self.find.as_ref().is_some_and(|f| f.kind == BandKind::Line)
+    }
+
+    /// The line Enter jumps to: the typed number, `0` the first line and `$` the last as in
+    /// vim, and past every file's end when it outgrows a `u32`. `None` on an empty field, where
+    /// Enter only closes.
+    pub fn line_target(&self) -> Option<u32> {
+        let f = self.find.as_ref().filter(|_| self.line_open())?;
+        match f.query.as_str() {
+            "$" => Some(u32::MAX),
+            digits if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) => {
+                Some(digits.parse::<u32>().unwrap_or(u32::MAX))
+            }
+            _ => None,
+        }
+    }
+
+    /// Type into the line field: a digit extends the number, `$` (the last line) stands alone,
+    /// and a digit after `$` starts a number.
+    pub fn line_type(&mut self, c: char) {
+        self.edit_input(|v, caret| {
+            if c == '$' || v.as_slice() == ['$'] {
+                v.clear();
+                *caret = 0;
+            }
+            v.insert(*caret, c);
+            *caret += 1;
+        });
+    }
+
+    /// `enter` in the line field: close it and jump to the typed line. An empty field only
+    /// closes.
+    pub fn line_go(&mut self) {
+        let target = self.line_target();
+        self.close_find();
+        if let Some(n) = target {
+            self.goto_line(n);
+        }
+    }
+
+    /// Which side's numbers `:N` uses: the new side's, or the old side's in a file with no new
+    /// lines (deleted or emptied).
+    fn line_side(&self) -> fn(&Row) -> Option<u32> {
+        if crate::marks::diff_lines(&self.visible).any(|r| r.new_no().is_some()) {
+            Row::new_no
+        } else {
+            Row::old_no
+        }
+    }
+
+    /// The open file's line count, as `:N` numbers it: the source's lines rendered, else the
+    /// last line on [`App::line_side`].
+    pub fn line_count(&self) -> usize {
+        if self.rendered_active() {
+            return self.rendered.content.as_ref().map_or(0, |c| c.text.lines().count());
+        }
+        let side = self.line_side();
+        crate::marks::diff_lines(&self.visible).filter_map(side).max().unwrap_or(0) as usize
+    }
+
+    /// Paste into the line field: a number, or `$`, replaces the field — quotes, backticks and
+    /// punctuation around it drop away. Anything else, a `path:line` included, leaves the field
+    /// as it was: whether a path means the open file is search's to resolve, not the field's.
+    fn paste_line(&mut self, text: &str) {
+        // Quotes, brackets and trailing punctuation drop; a sign stays and makes it no line.
+        let wrap =
+            ['`', '\'', '"', '“', '”', '‘', '’', '(', ')', '[', ']', '<', '>', ':', '.', ',', ';'];
+        let word = text.trim().trim_matches(wrap);
+        let line = word == "$" || (!word.is_empty() && word.bytes().all(|b| b.is_ascii_digit()));
+        if let Some(f) = self.find.as_mut().filter(|_| line) {
+            f.query = word.to_string();
+            f.caret = f.query.chars().count();
+        }
+    }
+
     /// `esc`: close the band, dropping the query. The cursor stays where the last step left it
     pub fn close_find(&mut self) {
         if self.mode == Mode::Find {
             self.mode = Mode::Normal;
         }
         self.find = None;
+    }
+
+    /// `:N`: land the read cursor on line `n` of the open file — the new side's line, or the old
+    /// side's in a file with no new-side lines; in rendered markdown the block holding source
+    /// line `n`. `0` is the first line and anything past the end the last, so a fold or a
+    /// collapsed `<details>` hiding either opens like any other. A jump is navigation, so a
+    /// line-range pick drops. Off screen, the line lands centered. Inert with nothing to land on.
+    pub fn goto_line(&mut self, n: u32) {
+        if !self.find_available() {
+            return;
+        }
+        let last = u32::try_from(self.line_count()).unwrap_or(u32::MAX).max(1);
+        let n = n.clamp(1, last);
+        self.clear_selection();
+        self.focus = Focus::Diff;
+        if self.rendered_active() {
+            self.open_disclosures_holding(n);
+            self.diff_cursor = self.rendered.index.row_at_line(n).unwrap_or(0);
+        } else {
+            self.diff_cursor = self.land_on_line(n, self.line_side());
+        }
+        self.reveal_center = true;
+    }
+
+    /// The source row holding line `n` by `side`'s numbering ([`line_row`]), its fold opened
+    /// first when one hides it — the one landing a find step and `:N` share.
+    fn land_on_line(&mut self, n: u32, side: fn(&Row) -> Option<u32>) -> usize {
+        let row = line_row(&self.visible, n, side);
+        let Some(anchor) = self.visible[row].fold_anchor() else { return row };
+        self.expanded_folds.insert(anchor);
+        self.rebuild_visible();
+        line_row(&self.visible, n, side)
+    }
+
+    /// Open every collapsed `<details>` whose body holds source line `n`, outermost included, so
+    /// the line renders; the rows rebuild around them.
+    fn open_disclosures_holding(&mut self, n: u32) {
+        let line = n as usize;
+        let closed: Vec<String> = self
+            .rendered
+            .doc
+            .disclosures
+            .iter()
+            .filter(|d| d.body <= line && line <= d.end && !self.details_open(&d.key))
+            .map(|d| d.key.clone())
+            .collect();
+        if closed.is_empty() {
+            return;
+        }
+        for key in closed {
+            self.rendered.details.insert(key, true);
+        }
+        self.rebuild_visible();
+    }
+
+    /// Whether the rendered rows were built with the `<details>` keyed `key` open.
+    fn details_open(&self, key: &str) -> bool {
+        self.rendered.built.as_ref().is_some_and(|b| b.input.details.iter().any(|k| k == key))
     }
 
     /// Every match of `query` over the open file in file order, the runs hidden inside folds
@@ -4728,9 +4937,8 @@ impl App {
             if let Row::Fold { lines } = row {
                 // A collapsed fold's lines are hidden, still searched; folds hold only
                 // context runs, so a folded line has a new-side number.
-                let anchor = row.fold_anchor().expect("a fold has a first hidden line");
                 let folded = lines.iter().filter(|l| is_hit(l)).filter_map(Row::new_no);
-                hits.extend(folded.map(|new_no| FindHit::Folded { anchor, new_no }));
+                hits.extend(folded.map(|new_no| FindHit::Folded { new_no }));
                 continue;
             }
             let m = is_hit(row);
@@ -4750,7 +4958,7 @@ impl App {
     pub fn find_step(&mut self, delta: i32) {
         // A query lives only while the band is open, and every path that leaves the rows
         // unsearchable closes the band — so a query here always has rows to search.
-        let Some(query) = self.find.as_ref().map(|f| f.query.clone()) else { return };
+        let Some(query) = self.find_query().map(str::to_string) else { return };
         if query.is_empty() {
             return;
         }
@@ -4768,24 +4976,21 @@ impl App {
         };
         match hits[target] {
             FindHit::Visible(v) => self.diff_cursor = v,
-            FindHit::Folded { anchor, new_no } => {
-                self.expanded_folds.insert(anchor);
-                self.rebuild_visible();
-                // Expanding the fold reveals the context row that held this new-side line number.
-                self.diff_cursor = self
-                    .visible
-                    .iter()
-                    .position(|r| r.new_no() == Some(new_no))
-                    .expect("the expanded fold reveals the row for this new_no");
-            }
+            FindHit::Folded { new_no } => self.diff_cursor = self.land_on_line(new_no, Row::new_no),
         }
         self.reveal_diff = true;
+    }
+
+    /// Find's query while the band is find; `None` for the line field, whose digits are no
+    /// search.
+    pub fn find_query(&self) -> Option<&str> {
+        self.find.as_ref().filter(|f| f.kind == BandKind::Text).map(|f| f.query.as_str())
     }
 
     /// The find band's count: the current match's 1-based ordinal (`None` off a match) and the
     /// total. `None` while the query is empty — the band shows a blank count then
     pub fn find_count(&self) -> Option<(Option<usize>, usize)> {
-        let query = &self.find.as_ref()?.query;
+        let query = self.find_query()?;
         if query.is_empty() {
             return None;
         }
@@ -5055,6 +5260,14 @@ impl App {
                     vec![(A::FlipSearchMode, Primary), (A::CloseSearch, Do)]
                 };
             }
+            Mode::Find if self.line_open() => {
+                // Enter jumps only to a line; an empty field only closes.
+                return if self.line_target().is_some() {
+                    vec![(A::LineGo, Primary), (A::CloseFind, Do)]
+                } else {
+                    vec![(A::CloseFind, Primary)]
+                };
+            }
             Mode::Find => {
                 // The steps show only with a match to step to, so the bar never lists a key that
                 // would not work.
@@ -5207,6 +5420,7 @@ impl App {
         // In-file find shows wherever the read pane has content to search.
         if self.find_available() {
             out.push((A::Find, Go));
+            out.push((A::GotoLine, Go));
         }
         // Rendered rows come pre-wrapped, so `w` acts only on source.
         if !self.rendered_active() {
@@ -6037,16 +6251,21 @@ fn source_line_at(rows: &[Row], i: usize) -> Option<u32> {
     rows[at..].iter().find_map(line_of).or_else(|| rows[..at].iter().rev().find_map(line_of))
 }
 
-/// The source row a rendered block starting on line `src` lands on: the row numbered `src`,
-/// else the collapsed fold hiding it, else the first row numbered past it, else the last row.
-fn source_row_of(rows: &[Row], src: u32) -> usize {
-    let holds = |r: &Row| match r {
-        Row::Fold { lines } => lines.iter().any(|l| l.new_no() == Some(src)),
-        _ => r.new_no() == Some(src),
+/// The row holding line `line` by `side`'s numbering: the row numbered `line`, else the
+/// collapsed fold hiding it, else the first row numbered past it, else the last numbered row —
+/// never a trailing row the side doesn't number (a deleted tail on the new side) — else the last
+/// row.
+fn line_row(rows: &[Row], line: u32, side: fn(&Row) -> Option<u32>) -> usize {
+    // A row's lines, a collapsed fold's hidden ones included.
+    let any_line = |r: &Row, pred: &dyn Fn(Option<u32>) -> bool| {
+        crate::marks::diff_lines(std::slice::from_ref(r)).any(|l| pred(side(l)))
     };
+    let numbered = |r: &Row| any_line(r, &|n| n.is_some());
+    let holds = |r: &Row| any_line(r, &|n| n == Some(line));
     rows.iter()
         .position(holds)
-        .or_else(|| rows.iter().position(|r| r.new_no().is_some_and(|n| n > src)))
+        .or_else(|| rows.iter().position(|r| side(r).is_some_and(|n| n > line)))
+        .or_else(|| rows.iter().rposition(numbered))
         .unwrap_or(rows.len().saturating_sub(1))
 }
 

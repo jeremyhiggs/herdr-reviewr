@@ -132,6 +132,7 @@ The keys below are defaults. You can rebind every action, even to several keys a
 | `→` `←` | Expand / collapse, or scroll sideways |
 | `/` | Search files and code |
 | `Ctrl+F` | Find in file |
+| `:` | Jump to a line number (`:0` first, `:$` last) |
 | `w` | Toggle line wrap |
 | `m` | Flip markdown between rendered and source |
 | `p` | Rotate navigator |
@@ -384,6 +385,7 @@ The action names and their defaults:
 | `comments` | `l` |
 | `search` | `/` |
 | `find` | `ctrl+f` |
+| `goto-line` | `:` |
 | `keys` | `?` |
 | `send` | `s`, `S` |
 | `copy` | `y`, `Y` |

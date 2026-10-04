@@ -13,6 +13,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session-only and isolated between comparisons. Existing configurations that already bind `R`
   must move that binding or rebind `toggle-reviewed`, because duplicate bindings fail validation.
 
+## [0.44.0] — 2026-10-03
+
+### Added
+- **Jump to a line**: `:` and a number land on that line (`:0` first, `:$` last), opening a fold or `<details>` that hides it.
+  Thanks [@black-snow](https://github.com/black-snow) ([#90](https://github.com/persiyanov/herdr-reviewr/issues/90)).
+- **Breaking: `:` is a new default key.** A `[keybindings]` config that already uses `:` now collides and must move it.
+
 ## [0.43.0] — 2026-10-03
 
 ### Changed

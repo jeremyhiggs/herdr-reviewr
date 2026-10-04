@@ -43,6 +43,7 @@ pub enum Action {
     Comments,
     Search,
     Find,
+    GotoLine,
     Keys,
     Send,
     Copy,
@@ -160,7 +161,7 @@ impl Key {
 
 /// Every action with its config name and default keys — the single source the default keymap,
 /// the name lookup, and the config error message are built from.
-const ACTIONS: [(Action, &str, &[Key]); 44] = [
+const ACTIONS: [(Action, &str, &[Key]); 45] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
     (Action::NextHunk, "next-hunk", &[Key::plain(']')]),
@@ -198,6 +199,7 @@ const ACTIONS: [(Action, &str, &[Key]); 44] = [
     (Action::Comments, "comments", &[Key::plain('l')]),
     (Action::Search, "search", &[Key::plain('/')]),
     (Action::Find, "find", &[Key::ctrl('f')]),
+    (Action::GotoLine, "goto-line", &[Key::plain(':')]),
     (Action::Keys, "keys", &[Key::plain('?')]),
     (Action::Send, "send", &[Key::plain('s'), Key::plain('S')]),
     (Action::Copy, "copy", &[Key::plain('y'), Key::plain('Y')]),
