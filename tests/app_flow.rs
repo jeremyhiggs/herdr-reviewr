@@ -5161,7 +5161,7 @@ fn a_failed_scope_rebuild_is_transactional_including_reviewed_state() {
 
     let result = app.set_scope(Scope::Branch);
     std::fs::write(&index, saved_index).unwrap();
-    assert!(result.is_err(), "the missing commit object fails the prospective build");
+    assert!(result.is_err(), "the unreadable index fails the prospective build");
     assert_eq!(app.scope, Scope::Uncommitted, "scope changes only after a successful build");
     assert_eq!(app.entries, before_entries, "the navigator stays on the prior snapshot");
     assert_eq!(app.diff, before_diff, "the loaded diff stays on the prior snapshot");
