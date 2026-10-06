@@ -167,6 +167,16 @@ impl FileIdentity {
         self.0.live_new_side
     }
 
+    /// Whether two comparisons share the same old file and can compare base-anchored edits.
+    pub(crate) fn same_old_side(&self, other: &Self) -> bool {
+        let (a, b) = (&self.0, &other.0);
+        a.old_endpoint == b.old_endpoint
+            && a.path == b.path
+            && a.previous_path == b.previous_path
+            && a.old_mode == b.old_mode
+            && a.old_content == b.old_content
+    }
+
     pub(crate) fn new_side_absent(&self) -> bool {
         self.0.new_mode == "000000"
     }

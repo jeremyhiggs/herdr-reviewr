@@ -13,8 +13,8 @@ Each file in the Changes navigator has one of three review states:
 | State | Display | Meaning |
 | --- | --- | --- |
 | Not reviewed | No review marker | The current comparison has not been accepted |
-| Reviewed | Green `✓` and subdued details | The displayed comparison matches the accepted one |
-| Reviewed but changed | Orange `!` | The file changed after its comparison was accepted |
+| Reviewed | Green `✓`, subdued details, and subdued changed blocks | The displayed comparison matches the accepted one |
+| Reviewed but changed | Orange `!` | The file changed after its comparison was accepted; unchanged reviewed blocks remain subdued |
 
 `R` toggles the current file's review state from either the navigator or the diff pane:
 
@@ -43,6 +43,10 @@ Review state is isolated by the comparison the user is viewing, including:
 
 A file that leaves a changeset loses its review state. If it later returns, it starts not reviewed.
 
+Review state stays in memory. For a reviewed text file, Reviewr retains compact fingerprints of the
+normalized base-to-reviewed edit blocks, not a second copy of the file and not a Git object or
+private ref.
+
 ## Refresh and identity
 
 A review records the exact comparison shown to the reviewer, not line counts alone. The identity
@@ -51,6 +55,13 @@ includes the comparison endpoints, paths, change kind, modes, content, and binar
 Refreshes reconcile review state only after a complete current snapshot lands. A stale or failed
 refresh keeps the last consistent file list and review state. If a file changes without leaving the
 changeset, its state becomes reviewed but changed.
+
+The pane continues to render its native base-to-current diff. A current edit block is subdued only
+when its base range and replacement lines exactly match a retained reviewed block. A new, moved, or
+modified block keeps the normal diff emphasis; changing any part of a block restores emphasis to
+the whole block. A reviewed block reverted to the base simply leaves the displayed diff. Reviewr
+applies the same treatment to source diffs and rendered Markdown blocks. It uses the same pairwise
+diff engine for both comparisons and does not construct a separate three-way diff.
 
 Marking or reconciling a file adds no writes. Reviewr's existing refresh machinery may use its
 private refs, session index copies, and snapshot objects, but never mutates the worktree, real

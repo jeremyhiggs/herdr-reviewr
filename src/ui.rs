@@ -1865,6 +1865,7 @@ fn render_diff_view(frame: &mut Frame, app: &App, area: Rect) {
                         selected: selecting && row >= lo && row <= hi,
                         hovered: hovered_row == Some(row),
                         lead: app.is_rendered_lead(row),
+                        reviewed: app.diff_row_reviewed(row),
                     };
                     row_cache = Some((row, render_row(&app.visible[row], layout, state)));
                 }
@@ -1978,6 +1979,8 @@ struct RowState {
     hovered: bool,
     /// Whether a rendered row leads its block and so shows its line number.
     lead: bool,
+    /// Whether this changed row's complete base-anchored edit is still reviewed.
+    reviewed: bool,
 }
 
 /// A diff row's display lines: bar, number, tinted code, wrapped or h-scrolled.
@@ -1994,7 +1997,7 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         rendered,
         see,
     } = layout;
-    let RowState { commented, cursor, selected, hovered, lead } = state;
+    let RowState { commented, cursor, selected, hovered, lead, reviewed } = state;
     // A commented line's number wears your comment color; others are muted.
     let num_ink = if commented { Ink::Comment } else { Ink::TextMuted };
     let highlight = match_style(pal);
@@ -2003,10 +2006,15 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         let (num_color, plus) = (pal.ink(num_ink, on), pal.ink(Ink::Comment, on));
         // Only the lead line is numbered; the bar cell shows the change mark.
         let num = if lead { src.to_string() } else { String::new() };
+        let reviewed_ink = reviewed.then_some(Ink::TextMuted);
         let (bar, bar_color) = match kind {
             RenderedKind::Block { bar: None, .. } => (" ", pal.mark(Ink::Border, on)),
-            RenderedKind::Block { bar: Some(b), .. } => ("▌", pal.mark(bar_ink(*b), on)),
-            RenderedKind::Marker { kind, .. } => ("▌", pal.mark(marker_ink(*kind), on)),
+            RenderedKind::Block { bar: Some(b), .. } => {
+                ("▌", pal.mark(reviewed_ink.unwrap_or_else(|| bar_ink(*b)), on))
+            }
+            RenderedKind::Marker { kind, .. } => {
+                ("▌", pal.mark(reviewed_ink.unwrap_or_else(|| marker_ink(*kind)), on))
+            }
         };
         let mut spans = gutter_spans(bar, bar_color, &num, num_color, hovered, gutter_w, plus);
         let code_width = width.saturating_sub(gutter_prefix_width(gutter_w));
@@ -2018,7 +2026,9 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
                     .unwrap_or_default()
                     .into_iter()
                     .map(|mut sp| {
-                        if let Some(fg) = sp.style.fg {
+                        if reviewed {
+                            sp.style = sp.style.fg(pal.ink(Ink::TextMuted, on));
+                        } else if let Some(fg) = sp.style.fg {
                             // Syntax and markdown colors keep their legibility on the row's fill.
                             sp.style = sp.style.fg(pal.legible(fg, on));
                         }
@@ -2039,12 +2049,14 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
                 if let (Some(n), Some(b)) = (hides, bar) {
                     let note = format!("  · {n} changed {}", plural(*n, "line"));
                     let note = truncate_width(&note, code_width.saturating_sub(used));
-                    spans.push(Span::styled(note, Style::default().fg(pal.ink(bar_ink(*b), on))));
+                    let ink = reviewed_ink.unwrap_or_else(|| bar_ink(*b));
+                    spans.push(Span::styled(note, Style::default().fg(pal.ink(ink, on))));
                 }
             }
             RenderedKind::Marker { kind, lines, .. } => {
                 let text = truncate_width(&marker_text(*kind, *lines, see), code_width);
-                spans.push(Span::styled(text, Style::default().fg(pal.ink(marker_ink(*kind), on))));
+                let ink = reviewed_ink.unwrap_or_else(|| marker_ink(*kind));
+                spans.push(Span::styled(text, Style::default().fg(pal.ink(ink, on))));
             }
         }
         let mut out = Line::from(spans);
@@ -2073,18 +2085,19 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
         .or_else(|| row.old_no())
         .filter(|&n| n > 0)
         .map_or(String::new(), |n| n.to_string());
-    let (bar, bar_ink, tint) = match row.marker() {
+    let (bar, change_ink, tint) = match row.marker() {
         '-' => ("▌", Ink::Removed, Fill::Removed),
         '+' => ("▌", Ink::Added, Fill::Added),
         _ => (" ", Ink::Border, Fill::Base),
     };
     let on = row_fill(cursor, selected, focused, tint);
+    let bar_ink = if reviewed { Ink::TextMuted } else { change_ink };
     let (bar_color, num_color) = (pal.mark(bar_ink, on), pal.ink(num_ink, on));
     let plus = pal.ink(Ink::Comment, on);
     let row_bg = pal.bg(on);
 
     // A cursor or selection fill wins over word emphasis.
-    let emph_on = !cursor && !selected;
+    let emph_on = !cursor && !selected && !reviewed;
     let emph = match row.marker() {
         '-' => Fill::RemovedEmph,
         _ => Fill::AddedEmph,
@@ -2095,7 +2108,11 @@ fn render_row(row: &Row, layout: RowLayout<'_>, state: RowState) -> Vec<Line<'st
     let mut cells = code_cells(row, emph_on, &hl_ranges, pal.ink(Ink::Text, on));
     // Dim syntax colors move back to their plain legibility on the row's fill or emphasis.
     for cell in cells.iter_mut().filter(|c| !c.hl) {
-        cell.fg = pal.legible(cell.fg, if cell.emph { emph } else { on });
+        cell.fg = if reviewed {
+            pal.ink(Ink::TextMuted, on)
+        } else {
+            pal.legible(cell.fg, if cell.emph { emph } else { on })
+        };
     }
 
     let prefix_w = gutter_prefix_width(gutter_w);
@@ -4487,6 +4504,7 @@ fn push_finding_quote(
                 selected: false,
                 hovered: false,
                 lead: false,
+                reviewed: false,
             };
             lines.extend(render_row(row, layout, state));
         }

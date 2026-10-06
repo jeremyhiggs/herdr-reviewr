@@ -9,7 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - **Changed files can be marked reviewed with `R`.** A green `✓` records the exact diff for the
   current scope, base, or commit pick. If the file changes later, an orange `!` keeps the earlier
-  review visible until `R` accepts the new diff; press `R` again to clear it. Review state is
+  review visible until `R` accepts the new diff; unchanged reviewed blocks stay subdued in source
+  and rendered Markdown views while new or modified blocks keep their normal emphasis. Press `R`
+  again to clear it. Review state is
   session-only and isolated between comparisons. Existing configurations that already bind `R`
   must move that binding or rebind `toggle-reviewed`, because duplicate bindings fail validation.
 

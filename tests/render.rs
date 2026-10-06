@@ -450,6 +450,75 @@ fn reviewed_but_changed_rows_warn_without_subduing_file_details() {
 }
 
 #[test]
+fn reviewed_but_changed_diff_subdues_only_unchanged_reviewed_blocks() {
+    let r = Repo::init();
+    r.write("a.txt", "base\nmiddle\ntail\n");
+    r.commit_all("init");
+    r.write("a.txt", "base\nALREADY_SEEN\nmiddle\ntail\n");
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.txt", true));
+
+    r.write("a.txt", "base\nALREADY_SEEN\nmiddle\nLATER_CHANGE\ntail\n");
+    app.reload().unwrap();
+
+    let buf = render_buffer(&app);
+    assert_eq!(
+        cell_of(&buf, "ALREADY_SEEN").fg,
+        app.palette().ink(Ink::TextMuted, Fill::Added),
+        "an exact base-anchored edit that was reviewed is subdued",
+    );
+    assert_eq!(
+        cell_of(&buf, "LATER_CHANGE").fg,
+        app.palette().ink(Ink::Text, Fill::Added),
+        "a later edit keeps the normal diff emphasis",
+    );
+
+    r.write("a.txt", "base\nREWRITTEN\nmiddle\nLATER_CHANGE\ntail\n");
+    app.reload().unwrap();
+    let changed = render_buffer(&app);
+    assert_eq!(
+        cell_of(&changed, "REWRITTEN").fg,
+        app.palette().ink(Ink::Text, Fill::Added),
+        "changing any part of a reviewed edit restores the whole block's normal emphasis",
+    );
+}
+
+#[test]
+fn rendered_markdown_subdues_only_unchanged_reviewed_blocks() {
+    let r = Repo::init();
+    r.write("doc.md", "# Head\n\nmiddle\n\nend\n");
+    r.commit_all("init");
+    r.write("doc.md", "# Head\n\nalready seen\n\nmiddle\n\nend\n");
+    let mut app = app_on_rendered(&r);
+    app.focus = Focus::Diff;
+    assert!(app.set_file_reviewed("doc.md", true));
+
+    r.write("doc.md", "# Head\n\nalready seen\n\nmiddle\n\nlater change\n\nend\n");
+    app.reload().unwrap();
+
+    let buf = render_buffer(&app);
+    let muted = app.palette().ink(Ink::TextMuted, Fill::Base);
+    assert_eq!(
+        cell_of(&buf, "already seen").fg,
+        muted,
+        "the exact reviewed Markdown block is subdued",
+    );
+    assert_ne!(
+        cell_of(&buf, "later change").fg,
+        muted,
+        "a later Markdown block keeps its normal emphasis",
+    );
+
+    r.write("doc.md", "# Head\n\nrewritten\n\nmiddle\n\nlater change\n\nend\n");
+    app.reload().unwrap();
+    assert_ne!(
+        cell_of(&render_buffer(&app), "rewritten").fg,
+        muted,
+        "rewriting a reviewed Markdown block restores normal emphasis",
+    );
+}
+
+#[test]
 fn reviewed_changed_kinds_keep_their_status_and_notice_semantics() {
     let r = Repo::init();
     r.write(".gitattributes", "*.bin binary\n*.nodiff -diff\n");

@@ -210,7 +210,9 @@ Reviewed marks live only for the current session and are isolated by review cont
 base, and commit pick keeps its own marks. When a file's exact diff changes, including staged or
 unstaged content, mode, symlink target, or either comparison endpoint, its green `✓` becomes an
 orange `!` until `R` accepts the new diff. A mark is removed only when the file leaves the
-changeset. reviewr never persists marks or writes them to Git.
+changeset. In a changed file, unchanged reviewed blocks stay subdued in source and rendered
+Markdown views while new or modified blocks keep their normal emphasis. reviewr never persists
+marks or writes them to Git.
 
 Every scope respects `.gitignore`, so build output never clutters **Changes**. To review a file,
 track it. **All files** still browses any ignored path.

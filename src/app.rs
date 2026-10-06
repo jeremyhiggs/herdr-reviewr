@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 
-use crate::diff::{DiffCache, FileDiff, Notice, RenderedKind, Row, View};
+use crate::diff::{DiffCache, DiffLine, FileDiff, Notice, RenderedKind, ReviewedEdit, Row, View};
 use crate::export::{Agent, ExportTarget, format_all};
 use crate::file_list::{self, Entry, RowKind};
 use crate::forge;
@@ -19,7 +19,9 @@ use crate::model::{
     ChangeKind, ChangedFile, Comment, CommentStore, CommitPick, FileIdentity, Rev, ReviewContext,
     Scope, Side,
 };
-use crate::rendered::{Built, Content, OldMap, RenderedIndex, RenderedInput, RenderedView, RowId};
+use crate::rendered::{
+    Built, Content, OldMap, RenderedIndex, RenderedInput, RenderedView, RowId, unit_of,
+};
 use crate::roles::Palette;
 use crate::theme;
 use crate::world::{Changeset, PickStatus, PickVerdict};
@@ -65,9 +67,10 @@ pub enum FileReviewState {
 }
 
 #[derive(Debug)]
-enum ReviewMark {
-    Reviewed(FileIdentity),
-    Changed,
+struct ReviewMark {
+    identity: FileIdentity,
+    edits: Vec<ReviewedEdit>,
+    changed: bool,
 }
 
 /// What the file cursor points at, by path, to restore after a rebuild.
@@ -659,6 +662,10 @@ pub struct App {
     /// Human-authored, session-only decisions by semantic comparison and path.
     reviewed: HashMap<ReviewContext, HashMap<String, ReviewMark>>,
     pub diff: FileDiff,
+    /// Changed rows in the open diff whose whole base-anchored edit was reviewed unchanged.
+    reviewed_diff_lines: HashSet<DiffLine>,
+    /// Rendered Markdown units owned only by unchanged reviewed diff lines.
+    reviewed_rendered_units: HashSet<Unit>,
     /// `diff.rows` with folds applied: what the cursor and hit tests index.
     pub visible: Vec<Row>,
     /// Fold anchors (first-hidden-line numbers) currently expanded; survives a poll.
@@ -864,6 +871,8 @@ impl App {
             review_context: None,
             reviewed: HashMap::new(),
             diff: FileDiff::empty(),
+            reviewed_diff_lines: HashSet::new(),
+            reviewed_rendered_units: HashSet::new(),
             visible: Vec::new(),
             expanded_folds: HashSet::new(),
             diff_path: None,
@@ -1087,6 +1096,7 @@ impl App {
             let changed = self.changeset.files.clone();
             self.reconcile_reviewed(&context, &changed);
         }
+        self.sync_reviewed_rows();
     }
 
     fn config_snapshot(&self) -> &crate::config::PluginConfig {
@@ -1265,9 +1275,7 @@ impl App {
         let Some(reviewed) = self.reviewed.get_mut(context) else { return };
         reviewed.retain(|path, mark| {
             let Some(annotation) = changed.get(path) else { return false };
-            if matches!(mark, ReviewMark::Reviewed(identity) if annotation.identity != *identity) {
-                *mark = ReviewMark::Changed;
-            }
+            mark.changed |= annotation.identity != mark.identity;
             true
         });
         if reviewed.is_empty() {
@@ -1340,6 +1348,8 @@ impl App {
     /// Show no file: no diff, rows, render, or marks.
     fn clear_open_view(&mut self) {
         self.diff = FileDiff::empty();
+        self.reviewed_diff_lines.clear();
+        self.reviewed_rendered_units.clear();
         self.diff_path = None;
         self.rendered.clear();
         self.visible.clear();
@@ -1585,6 +1595,7 @@ impl App {
         if self.mode == Mode::Find && !self.find_available() {
             self.close_find();
         }
+        self.sync_reviewed_rows();
         self.revalidate_read_marks(clicked_before.as_deref());
     }
 
@@ -4023,11 +4034,10 @@ impl App {
         };
         match self.reviewed.get(context).and_then(|reviewed| reviewed.get(path)) {
             None => FileReviewState::Unreviewed,
-            Some(ReviewMark::Changed) => FileReviewState::ReviewedButChanged,
-            Some(ReviewMark::Reviewed(reviewed)) if reviewed != identity => {
+            Some(mark) if mark.changed || mark.identity != *identity => {
                 FileReviewState::ReviewedButChanged
             }
-            Some(ReviewMark::Reviewed(_)) => FileReviewState::Reviewed,
+            Some(_) => FileReviewState::Reviewed,
         }
     }
 
@@ -4106,13 +4116,21 @@ impl App {
             let Some(identity) = self.changeset.files.get(path).map(|a| a.identity.clone()) else {
                 return false;
             };
+            let edits = if self.diff_path.as_deref() == Some(path)
+                && self.diff.identity.as_ref() == Some(&identity)
+            {
+                self.diff.reviewed_edits()
+            } else {
+                Vec::new()
+            };
             let paths = self.reviewed.entry(context).or_default();
-            if paths.get(path).is_some_and(
-                |mark| matches!(mark, ReviewMark::Reviewed(reviewed) if *reviewed == identity),
-            ) {
+            if paths.get(path).is_some_and(|mark| {
+                !mark.changed && mark.identity == identity && mark.edits == edits
+            }) {
                 return false;
             }
-            paths.insert(path.to_string(), ReviewMark::Reviewed(identity));
+            paths.insert(path.to_string(), ReviewMark { identity, edits, changed: false });
+            self.sync_reviewed_rows();
             return true;
         }
         let Some(paths) = self.reviewed.get_mut(&context) else { return false };
@@ -4120,7 +4138,37 @@ impl App {
         if paths.is_empty() {
             self.reviewed.remove(&context);
         }
+        if changed {
+            self.sync_reviewed_rows();
+        }
         changed
+    }
+
+    /// Whether the open source or rendered row belongs to a reviewed edit that is still exact.
+    pub(crate) fn diff_row_reviewed(&self, row: usize) -> bool {
+        let Some(row) = self.visible.get(row) else { return false };
+        DiffLine::of(row).is_some_and(|line| self.reviewed_diff_lines.contains(&line))
+            || unit_of(row).is_some_and(|unit| self.reviewed_rendered_units.contains(&unit))
+    }
+
+    /// Rebuild the derived row set from the painted comparison and its retained review mark.
+    fn sync_reviewed_rows(&mut self) {
+        let lines = (|| {
+            let path = self.diff_path.as_deref()?;
+            let context = self.review_context.as_ref()?;
+            let mark = self.reviewed.get(context)?.get(path)?;
+            let identity = self.diff.identity.as_ref()?;
+            mark.identity.same_old_side(identity).then(|| self.diff.reviewed_lines(&mark.edits))
+        })()
+        .unwrap_or_default();
+        self.reviewed_diff_lines = lines;
+        self.reviewed_rendered_units.clear();
+        if !self.reviewed_diff_lines.is_empty() && self.rendered.on_screen() {
+            self.reviewed_rendered_units = self
+                .rendered
+                .marks
+                .reviewed_units(diff_lines(&self.diff.rows), &self.reviewed_diff_lines);
+        }
     }
 
     /// `/`: open the search screen, from any tab, from either pane.
