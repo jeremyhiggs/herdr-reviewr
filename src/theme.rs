@@ -1,7 +1,5 @@
-//! The theme catalog: each built-in theme's primitives, its paired syntax theme, and the fills it
-//! sets itself. [`crate::roles`] derives every color a component paints from these. One selection
-//! sets both the chrome palette and the syntax theme, so they never desync. The pane background
-//! stays the terminal's, so only fills and foregrounds are painted.
+//! The theme catalog: each theme's primitives, paired syntax theme, and own fills, one selection
+//! for both so they never desync; [`crate::roles`] derives every painted color from these.
 
 // This file is a color table; 6-digit `0xRRGGBB` literals read better grouped as one value.
 #![allow(clippy::unreadable_literal)]
@@ -178,10 +176,8 @@ const ROSE_PINE: Primitives =
     dark(0x191724, 0xe0def4, 0xeb6f92, 0x9ccfd8, 0xf6c177, 0xebbcba, 0xc4a7e7, 0x31748f, 0xc4a7e7);
 const ROSE_PINE_DAWN: Primitives =
     light(0xfaf4ed, 0x575279, 0xb4637a, 0x56949f, 0xea9d34, 0xd7827e, 0x907aa9, 0x286983, 0x907aa9);
-/// ayu Dark from `ayu-colors` 9.1: the `ui.bg` base (the terminal background ayu's own
-/// ports use), the `editor.fg` text, and its syntax palette. The accent is its blue, as herdr's
-/// `terminal` theme paints ayu: `common.accent` gold sits too close to its yellow, which means
-/// "modified".
+/// ayu Dark from `ayu-colors` 9.1: `ui.bg`, `editor.fg`, its syntax palette, and its blue as the
+/// accent, as herdr paints ayu: `common.accent` gold reads as "modified" yellow.
 const AYU: Primitives =
     dark(0x0d1017, 0xbfbdb6, 0xf07178, 0xaad94c, 0xffb454, 0xff8f40, 0xd2a6ff, 0x59c2ff, 0x59c2ff);
 /// Everforest dark, hard background: `bg0`, `fg` and the accents from `autoload/everforest.vim`.
@@ -329,12 +325,8 @@ mod tests {
         }
     }
 
-    /// The accent, your comment color and the merged chip each theme paints, as glyphs on the
-    /// background (lifted to 3:1 where the official color falls short). The accent is herdr's
-    /// pick where herdr ships the theme. Where two would read alike side by side, the later one
-    /// takes the theme's next hue: nord's comment is its blue, one-light's its purple, and
-    /// rose-pine-dawn's its pine; dracula's merged is its cyan, rose-pine's its pine, and
-    /// one-light's and rose-pine-dawn's their orange.
+    /// Each theme's accent, comment and merged colors on the background, lifted to 3:1; where two
+    /// read alike, the later takes the theme's next hue.
     #[test]
     fn every_theme_paints_its_accent_comment_and_merged() {
         let painted: [(&str, u32, u32, u32); 20] = [

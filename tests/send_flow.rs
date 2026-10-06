@@ -1,15 +1,16 @@
-//! End-to-end send dispatch through a fake herdr binary. This file is its own test process, so the HERDR_* environment it
-//! sets can never leak into another test binary, and no real herdr pane is ever addressed.
-#![cfg(unix)]
+//! Send dispatch end to end: a fake herdr CLI and socket, each test re-run in its own child.
 
 mod common;
 
 use std::env;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
-use common::{Repo, app_on};
+use common::{Repo, app_on, fake_herdr, herdr_calls, herdr_error};
 use herdr_reviewr::app::{App, Focus, Mode};
 use herdr_reviewr::keymap::Keymap;
 use herdr_reviewr::ui;
@@ -18,9 +19,9 @@ use ratatui::crossterm::event::{
     KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::layout::Rect;
+use tempfile::TempDir;
 
-// `cwd` rides every real `agent list` entry (api notes). Send ignores it and resolves from
-// the workspace, so it is here to keep the fixture honest rather than to steer the send.
+// `cwd` keeps the fixture honest; the send resolves from the workspace and ignores it.
 const TWO_AGENTS: &str = r#"{"result":{"agents":[
   {"agent":"claude","agent_status":"idle","pane_id":"w8:p1","tab_id":"w8:t1","workspace_id":"w8","cwd":"/w/one"},
   {"agent":"codex","agent_status":"working","pane_id":"w8:p2","tab_id":"w8:t1","workspace_id":"w8","cwd":"/w/two"}
@@ -29,43 +30,162 @@ const ONE_AGENT: &str = r#"{"result":{"agents":[
   {"agent":"claude","agent_status":"idle","pane_id":"w8:p1","tab_id":"w8:t1","workspace_id":"w8","cwd":"/w/one"}
 ]}}"#;
 
-/// A fake herdr: answers `agent list` from `agents.json`, `tab list` with one label, logs
-/// every invocation, and succeeds at everything else (`pane send-text`, `pane focus`). It
-/// fails whatever `fail` holds, so a dead pane and a broken enumeration both have a shape.
-fn write_fake_herdr(dir: &Path) -> PathBuf {
-    let script = dir.join("herdr");
-    fs::write(
-        &script,
-        "#!/bin/sh\n\
-         dir=$(dirname \"$0\")\n\
-         echo \"$@\" >> \"$dir/log\"\n\
-         case \"$*\" in\n\
-           $(cat \"$dir/fail\" 2>/dev/null || echo __none__)*)\n\
-             echo '{\"error\":{\"code\":\"pane_not_found\",\"message\":\"pane w8:p1 not found\"},\"id\":\"cli:request\"}' >&2\n\
-             exit 1 ;;\n\
-         esac\n\
-         case \"$1 $2\" in\n\
-           \"agent list\") cat \"$dir/agents.json\" ;;\n\
-           \"tab list\") echo '{\"result\":{\"tabs\":[{\"tab_id\":\"w8:t1\",\"label\":\"Grip\"}]}}' ;;\n\
-           *) : ;;\n\
-         esac\n",
-    )
-    .unwrap();
-    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-    script
+/// A line break as the request's JSON spells it, CRLF on Windows.
+const NL: &str = if cfg!(windows) { r"\r\n" } else { r"\n" };
+
+/// What the fake socket does with each request it reads.
+#[derive(Clone, Copy, Debug)]
+enum Reply {
+    /// herdr's success reply.
+    Result,
+    /// herdr's error reply for a pane that closed after it was resolved.
+    PaneGone,
+    /// herdr's error reply for a failure of its own, the pane still there.
+    Internal,
+    /// Close the connection without answering.
+    Drop,
+    /// Hold the connection open and never answer.
+    Hang,
 }
 
-/// Make the fake herdr exit non-zero for every invocation starting with `prefix`.
-fn fail_on(dir: &Path, prefix: &str) {
-    fs::write(dir.join("fail"), prefix).unwrap();
+/// A fake herdr socket: one request line per connection, answered and recorded.
+#[derive(Clone)]
+struct FakeSocket {
+    requests: Arc<Mutex<Vec<String>>>,
+    reply: Arc<Mutex<Reply>>,
 }
 
-fn fail_on_nothing(dir: &Path) {
-    let _ = fs::remove_file(dir.join("fail"));
+impl FakeSocket {
+    fn serve(path: &Path) -> Self {
+        let socket = Self {
+            requests: Arc::new(Mutex::new(Vec::new())),
+            reply: Arc::new(Mutex::new(Reply::Result)),
+        };
+        listen(path, socket.clone());
+        socket
+    }
+
+    fn reply(&self, reply: Reply) {
+        *self.reply.lock().unwrap() = reply;
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// The requests that addressed `pane`.
+    fn sends_to(&self, pane: &str) -> usize {
+        let field = format!(r#""pane_id":"{pane}""#);
+        self.requests().iter().filter(|request| request.contains(&field)).count()
+    }
 }
 
-fn log(dir: &Path) -> String {
-    fs::read_to_string(dir.join("log")).unwrap_or_default()
+/// Bind a Unix domain socket at `path`, as herdr does on unix, and serve it on its own thread.
+#[cfg(unix)]
+fn listen(path: &Path, socket: FakeSocket) {
+    let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
+    thread::spawn(move || answer_each(listener.incoming(), &socket));
+}
+
+/// Bind the named pipe herdr binds for a socket path on Windows.
+#[cfg(windows)]
+fn listen(path: &Path, socket: FakeSocket) {
+    use interprocess::local_socket::{GenericNamespaced, ListenerOptions, prelude::*};
+    let name = path.to_string_lossy().into_owned().to_ns_name::<GenericNamespaced>().unwrap();
+    let listener = ListenerOptions::new().name(name).create_sync().unwrap();
+    thread::spawn(move || answer_each(listener.incoming(), &socket));
+}
+
+fn answer_each<S: Read + Write>(
+    incoming: impl Iterator<Item = io::Result<S>>,
+    socket: &FakeSocket,
+) {
+    let mut held = Vec::new();
+    for stream in incoming {
+        let mut reader = BufReader::new(stream.unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request = request.trim_end_matches('\n').to_owned();
+        let id = serde_json::from_str::<serde_json::Value>(&request).unwrap()["id"].clone();
+        socket.requests.lock().unwrap().push(request);
+        let answer = match *socket.reply.lock().unwrap() {
+            Reply::Result => serde_json::json!({"id": id, "result": {"type": "ok"}}),
+            Reply::PaneGone => serde_json::json!({"id": id, "error": {
+                "code": "pane_not_found", "message": "pane w8:p1 not found",
+            }}),
+            Reply::Internal => serde_json::json!({"id": id, "error": {
+                "code": "internal", "message": "boom",
+            }}),
+            Reply::Drop => continue,
+            Reply::Hang => {
+                held.push(reader);
+                continue;
+            }
+        };
+        writeln!(reader.get_mut(), "{answer}").unwrap();
+    }
+}
+
+/// Re-run test `name` in a child with the herdr env applied at spawn; returns its fixture dir.
+fn run_in_child(name: &str, socket: bool) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let mut child = Command::new(env::current_exe().unwrap());
+    child
+        .args(["--exact", name, "--nocapture"])
+        .env("SEND_FLOW_CHILD", "1")
+        .env("FAKE_HERDR_DIR", dir.path())
+        .env("HERDR_BIN_PATH", fake_herdr())
+        .env("HERDR_WORKSPACE_ID", "w8")
+        .env("HERDR_PANE_ID", "w8:p9");
+    if socket {
+        child.env("HERDR_SOCKET_PATH", dir.path().join("herdr.sock"));
+    } else {
+        child.env_remove("HERDR_SOCKET_PATH");
+    }
+    let out = child.output().expect("re-exec the test with the fake herdr env");
+    assert!(
+        out.status.success(),
+        "child run failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    dir
+}
+
+fn in_child() -> bool {
+    env::var("SEND_FLOW_CHILD").is_ok()
+}
+
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env::var("FAKE_HERDR_DIR").expect("set by the parent run"))
+}
+
+fn socket_path() -> PathBuf {
+    PathBuf::from(env::var("HERDR_SOCKET_PATH").expect("set by the parent run"))
+}
+
+fn agents(dir: &Path, json: &str) {
+    fs::write(dir.join("agents.json"), json).unwrap();
+}
+
+/// Make the fake herdr's `agent list` fail the way herdr does, or stop failing.
+fn agent_list_fails(dir: &Path, fails: bool) {
+    let path = dir.join("agentsfail");
+    if fails {
+        fs::write(path, herdr_error("internal")).unwrap();
+    } else {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// The one-file repo every send runs over: the first added line is `a.rs:2`, `+beta`.
+fn app() -> (Repo, App) {
+    let r = Repo::init();
+    r.write("a.rs", "alpha\n");
+    r.commit_all("init");
+    r.write("a.rs", "alpha\nbeta\n");
+    let app = app_on(&r);
+    (r, app)
 }
 
 /// Save one comment on the first added line, so `Send` has something to deliver.
@@ -81,57 +201,28 @@ fn press(app: &mut App, code: KeyCode, area: Rect, keymap: &Keymap) {
     handle_key(app, KeyEvent::from(code), area, keymap).unwrap();
 }
 
-/// The crate forbids `unsafe`, which rules out in-process `env::set_var`, so the parent
-/// run re-executes this same test in a child process with the HERDR_* seam applied at
-/// spawn — env applied to a child is safe, and the child alone runs the body.
 #[test]
 fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
-    if env::var("SEND_FLOW_CHILD").is_err() {
-        let staging = tempfile::TempDir::new().expect("tempdir");
-        let script = write_fake_herdr(staging.path());
-        let out = std::process::Command::new(env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "send_dispatches_one_agent_directly_and_several_through_the_picker",
-                "--nocapture",
-            ])
-            .env("SEND_FLOW_CHILD", "1")
-            .env("FAKE_HERDR_DIR", staging.path())
-            .env("HERDR_BIN_PATH", &script)
-            .env("HERDR_WORKSPACE_ID", "w8")
-            .env("HERDR_PANE_ID", "w8:p9")
-            .output()
-            .expect("re-exec the test with the fake herdr env");
-        assert!(
-            out.status.success(),
-            "child run failed:\n{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        // libtest exits 0 when `--exact` matches nothing, so the status alone cannot tell a
-        // passing body from a filter that selected no test. The fake herdr's log is the proof
-        // the body actually ran and delivered.
-        assert!(
-            log(staging.path()).contains("pane send-text"),
-            "the child ran no send — did the test name and the `--exact` filter drift apart?\n{}",
-            String::from_utf8_lossy(&out.stdout),
-        );
+    if !in_child() {
+        let dir =
+            run_in_child("send_dispatches_one_agent_directly_and_several_through_the_picker", true);
+        assert!(herdr_calls(dir.path()).contains("agent focus"), "the child delivered no send");
         return;
     }
 
-    let r = Repo::init();
-    r.write("a.rs", "alpha\n");
-    r.commit_all("init");
-    r.write("a.rs", "alpha\nbeta\n");
-
-    let fake_dir = PathBuf::from(env::var("FAKE_HERDR_DIR").expect("set by the parent run"));
+    let fake_dir = fixture_dir();
+    let socket = FakeSocket::serve(&socket_path());
+    let (_repo, mut app) = app();
     let keymap = Keymap::default();
     let area = Rect::new(0, 0, 80, 24);
-    let mut app = app_on(&r);
+    fs::write(
+        fake_dir.join("tabs.json"),
+        r#"{"result":{"tabs":[{"tab_id":"w8:t1","label":"Grip"}]}}"#,
+    )
+    .unwrap();
 
-    // Several agents: `s` opens the picker over both rows, labelled from `tab list`, and with
-    // nothing sent yet the highlight arms on the first row.
-    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    // Several agents: the picker opens over both, labelled by tab, on the first row.
+    agents(&fake_dir, TWO_AGENTS);
     write_comment(&mut app, "one");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.mode, Mode::Picker, "several agents open the picker");
@@ -139,47 +230,39 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     assert_eq!(app.picker_rows[0].tab, "Grip", "the tab label joins on tab_id");
     assert_eq!(app.picker_cursor, 0, "nothing sent this session arms the first row");
 
-    // A chosen pane that closed while the picker was open fails the send, and every comment
-    // stays. Nothing arms, since nothing was delivered.
-    fail_on(&fake_dir, "pane send-text w8:p1");
+    // A pane closed while the picker was open fails the send; comments stay.
+    socket.reply(Reply::PaneGone);
     press(&mut app, KeyCode::Enter, area, &keymap);
     assert_eq!(app.mode, Mode::Normal, "the picker closes whatever the outcome");
     assert_eq!(app.store.len(), 1, "a failed send keeps every comment");
-    // One short sentence a reviewer can read. herdr's own wording is a JSON envelope around a
-    // pane id, and the argv it came from carries the whole review in its last argument — both
-    // would fill a 40-column footer without naming anything.
-    assert_eq!(app.status, "claude closed");
+    // One short sentence, never herdr's JSON envelope.
+    assert_eq!(app.status, "claude closed, press y to copy");
     assert_eq!(app.last_sent_pane, None, "a failed send arms nothing");
-    fail_on_nothing(&fake_dir);
+    socket.reply(Reply::Result);
 
-    // One agent: `s` sends straight through, no picker frame in between — and the direct
-    // send arms its agent like a picker send.
-    fs::write(fake_dir.join("agents.json"), ONE_AGENT).unwrap();
+    // One agent: `s` sends with no picker, and arms that agent as a picker send would.
+    agents(&fake_dir, ONE_AGENT);
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.mode, Mode::Normal, "one agent sends directly");
     assert!(app.store.is_empty(), "a successful send consumes the whole set");
     assert_eq!(app.status, "sent 1 comment to claude");
     assert_eq!(app.last_sent_pane.as_deref(), Some("w8:p1"));
 
-    // An agent at a prompt takes no send: the prompt owns the screen, so the paste would land in
-    // it. The state is read at the send, so a picker row that went stale is caught too, and every
-    // comment stays.
-    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    // An agent at a prompt takes no send, read at the send itself.
+    agents(&fake_dir, TWO_AGENTS);
     write_comment(&mut app, "two");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     press(&mut app, KeyCode::Char('2'), area, &keymap);
-    fs::write(fake_dir.join("agents.json"), TWO_AGENTS.replace("\"working\"", "\"blocked\""))
-        .unwrap();
-    let sends = log(&fake_dir).matches("pane send-text w8:p2").count();
+    agents(&fake_dir, &TWO_AGENTS.replace("\"working\"", "\"blocked\""));
+    let sends = socket.sends_to("w8:p2");
     press(&mut app, KeyCode::Enter, area, &keymap);
     assert_eq!(app.mode, Mode::Normal);
     assert_eq!(app.store.len(), 1, "an agent at a prompt keeps every comment");
     assert_eq!(app.status, "answer codex's prompt first");
-    assert_eq!(log(&fake_dir).matches("pane send-text w8:p2").count(), sends);
+    assert_eq!(socket.sends_to("w8:p2"), sends, "nothing was pasted");
 
-    // `enter` sends to the digit-selected agent mid-turn, as a review into a running agent
-    // always has: the paste waits in its input. It consumes the set.
-    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    // `enter` sends to the digit-picked agent mid-turn, and consumes the set.
+    agents(&fake_dir, TWO_AGENTS);
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     press(&mut app, KeyCode::Char('2'), area, &keymap);
     press(&mut app, KeyCode::Enter, area, &keymap);
@@ -187,24 +270,16 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     assert!(app.store.is_empty(), "a successful send consumes the whole set");
     assert_eq!(app.status, "sent 1 comment to codex");
     assert_eq!(app.last_sent_pane.as_deref(), Some("w8:p2"));
-    assert!(log(&fake_dir).contains("pane send-text w8:p2"), "log: {}", log(&fake_dir));
-    // The start marker opens the payload at the CLI boundary; `pasted()` owns the rationale.
-    assert!(
-        log(&fake_dir).contains("pane send-text w8:p2 \u{1b}[200~"),
-        "the send is framed as a bracketed paste: {}",
-        log(&fake_dir)
+    // The whole request herdr received.
+    assert_eq!(
+        socket.requests().last().unwrap(),
+        &format!(
+            r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p2","text":"\u001b[200~a.rs:2{NL}+beta{NL}two\u001b[201~"}}}}"#
+        )
     );
-    // The batch's last bytes are the comment text "two", so this pins the terminator to the
-    // end of a delivered payload.
-    assert!(
-        log(&fake_dir).contains("two\u{1b}[201~"),
-        "the frame terminator closes the batch: {}",
-        log(&fake_dir)
-    );
-    assert!(log(&fake_dir).contains("agent focus w8:p2"), "a send focuses its pane");
+    assert!(herdr_calls(&fake_dir).contains("agent focus w8:p2"), "a send focuses its pane");
 
-    // Several again: the last-sent agent outranks the first row, and a first click on that
-    // armed row sends immediately.
+    // The last-sent agent outranks the first row and sends on one click.
     write_comment(&mut app, "three");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.mode, Mode::Picker);
@@ -229,62 +304,56 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
     .unwrap();
     assert_eq!(app.mode, Mode::Normal, "a first click on the armed row sends");
     assert!(app.store.is_empty());
-    let sends = log(&fake_dir).matches("pane send-text w8:p2").count();
     assert_eq!(
-        sends,
+        socket.sends_to("w8:p2"),
         2,
-        "the digit-selected send and the armed-row click addressed the same pane: {}",
-        log(&fake_dir)
+        "the digit-selected send and the armed-row click addressed the same pane"
     );
 
-    // No agent, and an enumeration herdr never answered, both refuse and name the clipboard —
-    // and neither opens a picker.
-    fs::write(fake_dir.join("agents.json"), r#"{"result":{"agents":[]}}"#).unwrap();
+    // No agent, or no answer from herdr: both refuse, name the clipboard, and open no picker.
+    agents(&fake_dir, r#"{"result":{"agents":[]}}"#);
     write_comment(&mut app, "four");
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.mode, Mode::Normal, "an empty workspace opens no picker");
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
     assert_eq!(app.status, "no agent in this workspace, press y to copy");
 
-    fail_on(&fake_dir, "agent list");
+    agent_list_fails(&fake_dir, true);
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.mode, Mode::Normal, "a failed enumeration opens no picker");
     assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
-    // A failed enumeration says so rather than claiming a count. The argv and herdr's stderr go
-    // to the log, so the sentence still fits a 40-column footer.
-    assert_eq!(app.status, "herdr didn't answer, press y to copy");
+    // A refused enumeration says herdr refused, never a count.
+    assert_eq!(app.status, "herdr refused the send, press y to copy");
 
-    // The sole agent is refused the same way at a prompt: `send_target` and the send each read
-    // the list, and the send's read decides.
-    fail_on_nothing(&fake_dir);
-    fs::write(fake_dir.join("agents.json"), ONE_AGENT.replace("\"idle\"", "\"blocked\"")).unwrap();
+    // The sole agent at a prompt is refused the same way.
+    agent_list_fails(&fake_dir, false);
+    agents(&fake_dir, &ONE_AGENT.replace("\"idle\"", "\"blocked\""));
     press(&mut app, KeyCode::Char('s'), area, &keymap);
     assert_eq!(app.store.len(), 1, "a sole agent at a prompt keeps every comment");
     assert_eq!(app.status, "answer claude's prompt first");
 
     // A chosen agent gone from the list by the time `enter` lands takes nothing.
-    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    agents(&fake_dir, TWO_AGENTS);
     press(&mut app, KeyCode::Char('s'), area, &keymap);
-    fs::write(fake_dir.join("agents.json"), ONE_AGENT).unwrap();
+    agents(&fake_dir, ONE_AGENT);
     press(&mut app, KeyCode::Char('2'), area, &keymap);
-    let sends = log(&fake_dir).matches("pane send-text").count();
+    let sends = socket.requests().len();
     press(&mut app, KeyCode::Enter, area, &keymap);
     assert_eq!(app.store.len(), 1, "a gone agent keeps every comment");
-    assert_eq!(app.status, "codex closed");
-    assert_eq!(log(&fake_dir).matches("pane send-text").count(), sends, "nothing was pasted");
+    assert_eq!(app.status, "codex closed, press y to copy");
+    assert_eq!(socket.requests().len(), sends, "nothing was pasted");
 
-    // A herdr that stops answering by then says so, rather than claiming the agent is gone.
-    fs::write(fake_dir.join("agents.json"), TWO_AGENTS).unwrap();
+    // A herdr that refuses by then says so, rather than claiming the agent is gone.
+    agents(&fake_dir, TWO_AGENTS);
     press(&mut app, KeyCode::Char('s'), area, &keymap);
-    fail_on(&fake_dir, "agent list");
+    agent_list_fails(&fake_dir, true);
     press(&mut app, KeyCode::Enter, area, &keymap);
     assert_eq!(app.store.len(), 1);
-    assert_eq!(app.status, "herdr didn't answer, press y to copy");
-    fail_on_nothing(&fake_dir);
+    assert_eq!(app.status, "herdr refused the send, press y to copy");
+    agent_list_fails(&fake_dir, false);
 
-    // The quit question hands `s` to the send itself, on any tab: the comments go out and the
-    // pane stays open.
-    fs::write(fake_dir.join("agents.json"), ONE_AGENT).unwrap();
+    // The quit question's `s` sends, and the pane stays open.
+    agents(&fake_dir, ONE_AGENT);
     for tab in ['1', '3'] {
         press(&mut app, KeyCode::Char(tab), area, &keymap);
         if app.store.is_empty() {
@@ -299,4 +368,113 @@ fn send_dispatches_one_agent_directly_and_several_through_the_picker() {
         assert!(app.store.is_empty(), "the answer sent them: {tab}");
         assert_eq!(app.status, "sent 1 comment to claude", "{tab}");
     }
+}
+
+/// Comments leave only on a `result` reply.
+#[test]
+fn a_send_consumes_the_comments_only_on_a_result_reply() {
+    if !in_child() {
+        let dir = run_in_child("a_send_consumes_the_comments_only_on_a_result_reply", true);
+        assert!(herdr_calls(dir.path()).contains("agent focus"), "the child delivered no send");
+        return;
+    }
+
+    let socket = FakeSocket::serve(&socket_path());
+    agents(&fixture_dir(), ONE_AGENT);
+    let (_repo, mut app) = app();
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    write_comment(&mut app, "naming");
+    let request = format!(
+        r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p1","text":"\u001b[200~a.rs:2{NL}+beta{NL}naming\u001b[201~"}}}}"#
+    );
+
+    for (reply, status) in [
+        (Reply::PaneGone, "claude closed, press y to copy"),
+        // A refusal of herdr's own never claims the agent closed: its pane is still there.
+        (Reply::Internal, "herdr refused the send, press y to copy"),
+        (Reply::Drop, "herdr didn't answer, press y to copy"),
+        // Waits out the whole send bound, past herdr's own read deadline.
+        (Reply::Hang, "herdr didn't answer, press y to copy"),
+    ] {
+        socket.reply(reply);
+        press(&mut app, KeyCode::Char('s'), area, &keymap);
+        assert_eq!(socket.requests().last(), Some(&request), "{reply:?}");
+        assert_eq!(app.store.len(), 1, "{reply:?} keeps every comment");
+        assert_eq!(app.status, status, "{reply:?}");
+    }
+
+    socket.reply(Reply::Result);
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(socket.requests().last(), Some(&request));
+    assert!(app.store.is_empty(), "a result reply consumes the whole set");
+    assert_eq!(app.status, "sent 1 comment to claude");
+}
+
+/// A review past Windows' command-line cap sends; one past the send cap refuses.
+#[test]
+fn a_long_review_sends_whole_and_one_over_the_cap_refuses() {
+    if !in_child() {
+        let dir = run_in_child("a_long_review_sends_whole_and_one_over_the_cap_refuses", true);
+        assert!(herdr_calls(dir.path()).contains("agent focus"), "the child delivered no send");
+        return;
+    }
+
+    let socket = FakeSocket::serve(&socket_path());
+    agents(&fixture_dir(), ONE_AGENT);
+    let (_repo, mut app) = app();
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+
+    let long = "x".repeat(250 * 1024);
+    write_comment(&mut app, &long);
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert!(app.store.is_empty(), "a review just under the cap sends");
+    assert_eq!(app.status, "sent 1 comment to claude");
+    assert_eq!(
+        socket.requests().last().unwrap(),
+        &format!(
+            r#"{{"id":"reviewr:send","method":"pane.send_text","params":{{"pane_id":"w8:p1","text":"\u001b[200~a.rs:2{NL}+beta{NL}{long}\u001b[201~"}}}}"#
+        )
+    );
+
+    // The cap counts JSON escaping: each `"` is two bytes.
+    for review in ["x".repeat(300 * 1024), "\"".repeat(150 * 1024)] {
+        write_comment(&mut app, &review);
+        let sent = socket.requests().len();
+        press(&mut app, KeyCode::Char('s'), area, &keymap);
+        assert_eq!(app.status, "review too large to send, press y to copy");
+        assert_eq!(app.store.len(), 1, "an over-cap review keeps every comment");
+        assert_eq!(socket.requests().len(), sent, "nothing reached herdr");
+        app.store = herdr_reviewr::model::CommentStore::default();
+    }
+
+    // The cap counts the line breaks as sent: 192 KiB escaped with LF, 320 KiB with CRLF.
+    write_comment(&mut app, &"x\n".repeat(64 * 1024));
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    let want = if cfg!(windows) {
+        "review too large to send, press y to copy"
+    } else {
+        "sent 1 comment to claude"
+    };
+    assert_eq!(app.status, want);
+}
+
+/// No `HERDR_SOCKET_PATH` is no herdr to send to.
+#[test]
+fn a_send_without_a_socket_refuses_as_herdr_not_answering() {
+    if !in_child() {
+        let dir = run_in_child("a_send_without_a_socket_refuses_as_herdr_not_answering", false);
+        assert!(herdr_calls(dir.path()).contains("agent list"), "the child asked herdr nothing");
+        return;
+    }
+
+    agents(&fixture_dir(), ONE_AGENT);
+    let (_repo, mut app) = app();
+    let keymap = Keymap::default();
+    let area = Rect::new(0, 0, 80, 24);
+    write_comment(&mut app, "naming");
+    press(&mut app, KeyCode::Char('s'), area, &keymap);
+    assert_eq!(app.status, "herdr didn't answer, press y to copy");
+    assert_eq!(app.store.len(), 1, "a refusal keeps every comment");
 }

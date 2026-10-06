@@ -1,7 +1,4 @@
-//! In-memory review model: scopes, changed files, and comments.
-//!
-//! Comments live only for the session and are
-//! removed by export or delete — never by a refresh.
+//! The review model: scopes, changed files, and the session's comments, never lost to a refresh.
 
 /// Which set of changes the Changes view shows.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23,8 +20,7 @@ impl Scope {
         }
     }
 
-    /// The scope's name in the specs and in config values (`default_scope`): kebab-case,
-    /// unlike the header chip's spaced `label`.
+    /// The kebab-case name config values use (`default_scope`).
     pub fn name(self) -> &'static str {
         match self {
             Scope::Uncommitted => "uncommitted",
@@ -34,8 +30,7 @@ impl Scope {
         }
     }
 
-    /// Cycle to the next scope, for the header chip click: uncommitted → branch → last turn →
-    /// commits.
+    /// The next scope, for a click on the header chip.
     #[must_use]
     pub fn cycle(self) -> Self {
         match self {
@@ -47,23 +42,28 @@ impl Scope {
     }
 }
 
-/// The `commits` scope's pick: a contiguous run from `oldest` to `newest`, both full commit
-/// ids, equal for a run of one.
+/// The `commits` pick: the run `oldest..=newest`, full ids, equal for a run of one.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct CommitPick {
     pub oldest: String,
     pub newest: String,
 }
 
-/// The semantic namespace in which a human reviews changed files. Resolved commit/tree
-/// endpoints stay in each [`FileIdentity`], so a moving ref invalidates files without turning
-/// the old generation into a separately recoverable review context.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// The semantic namespace for reviewed files. Resolved endpoints stay in each identity, so a
+/// moving ref invalidates files without creating another recoverable context.
+#[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
 pub enum ReviewContext {
+    #[default]
     Uncommitted,
-    Branch { base: Option<String> },
-    LastTurn { baseline: Option<String> },
-    Commits { pick: Option<CommitPick> },
+    Branch {
+        base: Option<String>,
+    },
+    LastTurn {
+        baseline: Option<String>,
+    },
+    Commits {
+        pick: Option<CommitPick>,
+    },
 }
 
 impl CommitPick {
@@ -76,9 +76,7 @@ impl CommitPick {
     }
 }
 
-/// Where a comment's diff was read: the worktree, or the picked run it came from. A diff
-/// comment renders only while the active scope reads the same diff, both sides: a run and
-/// its newest commit alone share a new side but not an old one.
+/// Where a comment's diff was read; it renders only while the scope reads that same diff.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Rev {
     Worktree,
@@ -92,13 +90,12 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Renamed,
+    Copied,
     Untracked,
 }
 
-/// The exact comparison that produced one changed-file row.
-///
-/// Its representation is deliberately private: UI and authored-state code may compare and
-/// retain identities, but Git remains the sole authority for constructing them.
+/// The exact comparison behind a changed-file row. It stays opaque outside Git; other code may
+/// only compare and retain it.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct FileIdentity(std::sync::Arc<FileIdentityParts>);
 
@@ -156,16 +153,6 @@ impl FileIdentity {
         }))
     }
 
-    /// Reproduce this comparison identity with the worktree side a reader actually loaded.
-    /// Committed comparisons have no live side, so their identity is already exact.
-    #[cfg(test)]
-    pub(crate) fn with_loaded_worktree(&self, mode: &str, content: &[u8]) -> Self {
-        if !self.uses_live_worktree() {
-            return self.clone();
-        }
-        self.with_loaded_worktree_fingerprint(mode, &content_fingerprint(content))
-    }
-
     pub(crate) fn with_loaded_worktree_fingerprint(&self, mode: &str, content: &str) -> Self {
         if !self.uses_live_worktree() {
             return self.clone();
@@ -180,33 +167,34 @@ impl FileIdentity {
         self.0.live_new_side
     }
 
+    pub(crate) fn new_side_absent(&self) -> bool {
+        self.0.new_mode == "000000"
+    }
+
+    pub(crate) fn is_landed_deletion(&self) -> bool {
+        self.0.kind == ChangeKind::Deleted && self.new_side_absent()
+    }
+
+    pub(crate) fn live_side_certified(&self) -> bool {
+        !self.uses_live_worktree() || self.is_landed_deletion() || !self.new_side_absent()
+    }
+
+    pub(crate) fn is_dirty_gitlink(&self) -> bool {
+        self.new_is_gitlink() && !self.0.new_content.ends_with(":..")
+    }
+
+    #[cfg(test)]
     pub(crate) fn old_endpoint(&self) -> &str {
         &self.0.old_endpoint
     }
 
-    pub(crate) fn new_endpoint(&self) -> &str {
-        &self.0.new_endpoint
-    }
-
-    pub(crate) fn has_old_side(&self) -> bool {
-        self.0.old_mode != "000000"
-    }
-
+    #[cfg(test)]
     pub(crate) fn has_new_side(&self) -> bool {
         self.0.new_mode != "000000"
     }
 
-    pub(crate) fn old_gitlink_oid(&self) -> Option<&str> {
-        (self.0.old_mode == "160000").then_some(self.0.old_content.as_str())
-    }
-
     pub(crate) fn new_is_gitlink(&self) -> bool {
         self.0.new_mode == "160000"
-    }
-
-    pub(crate) fn committed_new_gitlink_oid(&self) -> Option<&str> {
-        (self.0.new_mode == "160000" && !self.uses_live_worktree())
-            .then_some(self.0.new_content.as_str())
     }
 
     #[cfg(test)]
@@ -227,10 +215,6 @@ impl FileIdentity {
     }
 }
 
-pub(crate) fn content_fingerprint(content: &[u8]) -> String {
-    blake3::hash(content).to_hex().to_string()
-}
-
 impl ChangeKind {
     pub fn marker(self) -> char {
         match self {
@@ -238,6 +222,7 @@ impl ChangeKind {
             ChangeKind::Modified => 'M',
             ChangeKind::Deleted => 'D',
             ChangeKind::Renamed => 'R',
+            ChangeKind::Copied => 'C',
             ChangeKind::Untracked => '?',
         }
     }
@@ -250,14 +235,15 @@ pub struct ChangedFile {
     pub kind: ChangeKind,
     pub additions: u32,
     pub deletions: u32,
-    /// The old path of a renamed file; `None` for every other kind. Its old content lives
-    /// at this path, so a rename diffs real content instead of reading as all-insertion.
+    /// The source path of a renamed or copied file, whose old content lives there.
     pub previous_path: Option<String>,
-    /// Git's own no-text-diff verdict for this change: binary content, or a path whose
-    /// `diff` attribute `.gitattributes` unsets. The pane reads it as the `binary` notice
-    /// without reading either side.
+    /// git's no-text-diff verdict, read as the binary notice.
     pub binary: bool,
-    /// Opaque identity of the exact old/new comparison represented by this row.
+    /// The bytes git stores on the old side, 0 where there is none.
+    pub old_size: u64,
+    /// The bytes git stores on the new side, 0 where there is none; `None` for the worktree.
+    pub new_size: Option<u64>,
+    /// The exact comparison which produced this row.
     pub identity: FileIdentity,
 }
 
@@ -278,8 +264,7 @@ pub struct Comment {
     /// Verbatim diff lines the comment anchors to, each keeping its `+`/`-`/space marker.
     pub lines: String,
     pub text: String,
-    /// True when anchored to a diff (the `Changes` tab); false for a File-view content comment
-    /// (the `All files` tab). Selects how staleness is judged.
+    /// A diff comment (`Changes`), else a content comment (`All files`).
     pub diff_anchored: bool,
     /// Where the new side was read.
     pub rev: Rev,
@@ -300,9 +285,7 @@ impl Comment {
     }
 }
 
-/// The in-memory comment list for one worktree review session. Every comment gets an id on
-/// add — monotonic, never reused, kept through an edit — so a reference to one never lands
-/// on another after the list shifts.
+/// The session's comments, each with an id never reused, so a reference never lands on another.
 #[derive(Default, Debug)]
 pub struct CommentStore {
     items: Vec<Comment>,

@@ -1,7 +1,4 @@
-//! Command-line flags and the shared plugin configuration boundary.
-//!
-//! Flags override defaults; the positional
-//! argument (if any) is the repo path, else the current directory.
+//! Command-line flags and the plugin config file, validated whole.
 
 use std::fmt;
 use std::io::ErrorKind;
@@ -17,16 +14,12 @@ pub struct Config {
     pub theme: Option<String>,
     /// `Some(false)` when `--wrap off` is passed; `None` keeps the default (wrap on).
     pub wrap: Option<bool>,
-    /// The plugin config directory, resolved once at startup by [`resolve_config_dir`];
-    /// every later config read rereads only the file inside it.
+    /// The plugin config directory, resolved once at startup.
     pub plugin_config_dir: Option<PathBuf>,
 }
 
 impl Config {
-    /// Parse `args` (the process arguments *after* argv\[0\]).
-    ///
-    /// Recognises `--poll <ms>` (min 200, default 2000), `--base <ref>`,
-    /// `--theme <name>`, and `--wrap on|off`; the first non-flag token is the repo path.
+    /// Parse the flags after argv\[0\]; the first non-flag argument is the repo path.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Self {
         let mut repo: Option<PathBuf> = None;
         let mut poll_ms: u64 = 2000;
@@ -88,15 +81,6 @@ pub enum MarkdownView {
     #[default]
     Source,
     Rendered,
-}
-
-impl MarkdownView {
-    fn as_str(self) -> &'static str {
-        match self {
-            MarkdownView::Source => "source",
-            MarkdownView::Rendered => "rendered",
-        }
-    }
 }
 
 /// Where the navigator sits around the read pane.
@@ -216,14 +200,12 @@ impl PluginConfig {
         &self.theme
     }
 
-    /// The scope a fresh reviewr pane is built with — startup and config recovery. A reread never
-    /// switches a running pane's scope.
+    /// A fresh pane's scope; a reread never switches a running one.
     pub fn default_scope(&self) -> crate::model::Scope {
         self.default_scope
     }
 
-    /// How a fresh pane shows markdown — startup and config recovery. A reread never flips a
-    /// running pane's view; `m` does.
+    /// How a fresh pane shows markdown; only `m` flips a running one.
     pub fn markdown_view(&self) -> MarkdownView {
         self.markdown_view
     }
@@ -278,38 +260,9 @@ impl PluginConfig {
     pub fn keymap(&self) -> &crate::keymap::Keymap {
         &self.keymap
     }
-
-    /// Stable machine-readable output consumed by the shell entry points.
-    pub fn to_json(&self) -> serde_json::Value {
-        let keybindings: serde_json::Map<String, serde_json::Value> = self
-            .keymap
-            .bindings()
-            .iter()
-            .map(|(action, keys)| {
-                let keys: Vec<String> = keys.iter().map(|k| k.config_str()).collect();
-                (action.name().to_owned(), serde_json::json!(keys))
-            })
-            .collect();
-        serde_json::json!({
-            "theme": self.theme,
-            "default_scope": self.default_scope.name(),
-            "markdown_view": self.markdown_view.as_str(),
-            "navigator_position": self.navigator_position.as_str(),
-            "toggle_placement": self.toggle_placement.as_str(),
-            "toggle_direction": self.toggle_direction.as_str(),
-            "auto_open": self.auto_open,
-            "github_host": self.github_host,
-            "gitlab_host": self.gitlab_host,
-            "azure_devops_host": self.azure_devops_host,
-            "editor": self.editor,
-            "url_opener": self.url_opener,
-            "keybindings": keybindings,
-        })
-    }
 }
 
-/// A whole-file configuration failure. It keeps the path in the value so every entry point can
-/// show the same actionable diagnostic.
+/// A whole-file config failure, carrying the path for one diagnostic everywhere.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PluginConfigError {
     path: PathBuf,
@@ -330,27 +283,20 @@ impl fmt::Display for PluginConfigError {
 
 impl std::error::Error for PluginConfigError {}
 
-/// The config directory, resolved once at an entrypoint's startup:
-/// `$HERDR_PLUGIN_CONFIG_DIR` when set, else the directory `cli` reports
-/// ([`crate::herdr::plugin_config_dir`]), else none — and none reads no config file.
+/// The config directory: `$HERDR_PLUGIN_CONFIG_DIR`, else what `cli` reports, else none.
 pub fn resolve_config_dir(cli: impl FnOnce() -> Option<String>) -> Option<PathBuf> {
-    config_dir_from(std::env::var_os("HERDR_PLUGIN_CONFIG_DIR"), cli)
+    config_dir_from(crate::herdr::var_os("HERDR_PLUGIN_CONFIG_DIR"), cli)
 }
 
-/// The resolution rule behind [`resolve_config_dir`], split out so tests can inject both
-/// inputs. An empty value names no directory on either branch — otherwise an empty env var
-/// would read `./config.toml` from the repo under review and block the pane on it.
+/// [`resolve_config_dir`]'s rule; an empty CLI answer names no directory, never the cwd.
 fn config_dir_from(
     env: Option<std::ffi::OsString>,
     cli: impl FnOnce() -> Option<String>,
 ) -> Option<PathBuf> {
-    env.filter(|dir| !dir.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| cli().filter(|dir| !dir.is_empty()).map(PathBuf::from))
+    env.map(PathBuf::from).or_else(|| cli().filter(|dir| !dir.is_empty()).map(PathBuf::from))
 }
 
-/// Read one plugin config snapshot from the resolved config directory. No directory reads no
-/// config file, which is the missing-file outcome and uses every default.
+/// Read the plugin config from `dir`; no directory means every default.
 pub fn plugin_config(dir: Option<&Path>) -> Result<PluginConfig, PluginConfigError> {
     match dir {
         Some(dir) => plugin_config_in(dir),
@@ -396,8 +342,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             "uncommitted" => crate::model::Scope::Uncommitted,
             "branch" => crate::model::Scope::Branch,
             "last-turn" => crate::model::Scope::LastTurn,
-            // `commits` needs a pick the pane does not yet hold, so it is not a start scope
-            // and falls to the error.
+            // `commits` needs a pick, so it cannot be a start scope.
             _ => {
                 return Err(value_error(
                     path,
@@ -493,8 +438,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             .as_str()
             .filter(|c| !c.trim().is_empty())
             .ok_or_else(|| value_error(path, value, "editor", "a non-empty command"))?;
-        // `{file}` and `{line}` are the whole grammar, so a typo for one of them would
-        // otherwise reach the editor as a literal word and open a file named after the typo
+        // A typo'd placeholder would reach the editor as a literal file name.
         if let Some(unknown) = unknown_placeholder(command, &["file", "line"]) {
             return Err(placeholder_error(path, "editor", &unknown, "`{file}` and `{line}`"));
         }
@@ -520,9 +464,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
         }
         config.url_opener = Some(command.to_owned());
     }
-    // A hostname is recognized by at most one forge; a cross-key collision is an invalid
-    // value under CFG-WHOLE-FILE. Scanned as a set so a new key joins by
-    // being listed, in the parse order above: the later key's error names the earlier owner.
+    // One hostname per forge; the later key's error names the earlier owner.
     let host_keys = [
         ("github_host", &config.github_host),
         ("gitlab_host", &config.gitlab_host),
@@ -547,10 +489,7 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
     Ok(config)
 }
 
-/// One `[keybindings]` key string → a [`Key`](crate::keymap::Key): a bare character or a
-/// named key, alone or behind a `ctrl+`/`alt+` prefix. The character is
-/// one visible cell — a positive display width also rejects the zero-width class `is_control`
-/// misses (format chars, combining marks).
+/// One `[keybindings]` key: a one-cell character or a named key, optionally `ctrl+`/`alt+`.
 fn parse_key(text: &str) -> Option<crate::keymap::Key> {
     use crate::keymap::KeyCode;
     let (ctrl, alt, rest) = if let Some(rest) = text.strip_prefix("ctrl+") {
@@ -575,9 +514,7 @@ fn parse_key(text: &str) -> Option<crate::keymap::Key> {
     }
 }
 
-/// Parse and resolve the `[keybindings]` table:
-/// action names from the keymap table in, each bound to a non-empty array of
-/// keys, a bare character or a `ctrl+`/`alt+` chord.
+/// Parse the `[keybindings]` table: each action name to a non-empty array of keys.
 fn parse_keybindings(
     path: &Path,
     value: &toml::Value,
@@ -646,8 +583,7 @@ fn string_value<'a>(
     value.as_str().ok_or_else(|| value_error(path, value, key, expected))
 }
 
-/// The one invalid-value grammar: the key, what it takes, and what it was given, so the line
-/// says what to fix without opening the file.
+/// An invalid value's error: the key, what it takes, and what it was given.
 fn value_error(path: &Path, value: &toml::Value, key: &str, expected: &str) -> PluginConfigError {
     // TOML's own spelling, so a string given where an array belongs reads as the string it is.
     let given = value.to_string();
@@ -657,8 +593,7 @@ fn value_error(path: &Path, value: &toml::Value, key: &str, expected: &str) -> P
     )
 }
 
-/// A command template naming a placeholder the key does not know: the typo, then the ones it
-/// does.
+/// An unknown placeholder's error: the typo, then the known ones.
 fn placeholder_error(path: &Path, key: &str, unknown: &str, known: &str) -> PluginConfigError {
     PluginConfigError::new(
         path,
@@ -673,10 +608,7 @@ fn unknown_key_error(path: &Path, key: &str, options: &str) -> PluginConfigError
     PluginConfigError::new(path, format!("unknown key `{key}`: expected one of {options}"))
 }
 
-/// The first `{` in `command` that opens neither `{file}` nor `{line}`.
-///
-/// A brace that closes nothing opens nothing either: `code {fil` would otherwise reach the
-/// editor as the literal argument `{fil`, which is the typo this rule exists to catch
+/// The first `{` in `command` opening no known placeholder, an unclosed one included.
 fn unknown_placeholder(command: &str, known: &[&str]) -> Option<String> {
     let mut rest = command;
     while let Some(at) = rest.find('{') {
@@ -693,9 +625,7 @@ fn unknown_placeholder(command: &str, known: &[&str]) -> Option<String> {
     None
 }
 
-/// Parse one self-hosted forge key: a bare hostname naming no built-in forge host — a
-/// hostname is recognized by at most one forge. The built-in set has
-/// one authority, `git::forge_for_host`, asked here with no self-hosted keys.
+/// Parse a self-hosted forge key: a bare hostname that no built-in forge already claims.
 fn parse_forge_host(
     path: &Path,
     key: &str,
@@ -729,15 +659,9 @@ pub(crate) fn valid_host_syntax(host: &str) -> bool {
     })
 }
 
-/// Print the shared normalized configuration for the plugin action script. This is its own
-/// entrypoint (`--resolve-plugin-config`), so it resolves the config directory itself — and
-/// initializes the log itself, or the herdr-side diagnostics of a failed lookup would be
-/// dropped on the one path that exercises the CLI fallback from a plain shell.
-pub fn print_plugin_config() -> Result<(), PluginConfigError> {
-    crate::log::init();
-    let dir = resolve_config_dir(crate::herdr::plugin_config_dir);
-    println!("{}", plugin_config(dir.as_deref())?.to_json());
-    Ok(())
+/// The plugin config a non-UI run reads: the env's dir, else herdr's.
+pub(crate) fn plugin_config_from_herdr() -> Result<PluginConfig, PluginConfigError> {
+    plugin_config(resolve_config_dir(crate::herdr::plugin_config_dir).as_deref())
 }
 
 #[cfg(test)]
@@ -781,14 +705,10 @@ mod tests {
         let dir =
             super::config_dir_from(Some("/tmp/cfg".into()), || panic!("cli asked despite the env"));
         assert_eq!(dir, Some(PathBuf::from("/tmp/cfg")));
-        // Env unset: the CLI's directory is used. An empty env value names no directory
-        // and falls through the same way.
+        // An unset env (`herdr::var_os` reads empty as unset) falls through to the CLI's directory.
         let dir = super::config_dir_from(None, || Some("/tmp/from-cli".to_string()));
         assert_eq!(dir, Some(PathBuf::from("/tmp/from-cli")));
-        let dir = super::config_dir_from(Some("".into()), || Some("/tmp/from-cli".to_string()));
-        assert_eq!(dir, Some(PathBuf::from("/tmp/from-cli")));
-        // An empty CLI answer names no directory either — `PathBuf::from("")` would read
-        // `./config.toml` from the repo under review.
+        // An empty CLI answer names no directory either.
         assert_eq!(super::config_dir_from(None, || Some(String::new())), None);
         // Neither resolves — herdr absent or refusing: no config directory.
         assert_eq!(super::config_dir_from(None, || None), None);
@@ -850,18 +770,14 @@ mod tests {
     }
 
     #[test]
-    fn the_editor_key_carries_its_whole_command_and_reaches_the_resolved_json() {
+    fn the_editor_key_carries_its_whole_command() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "editor = \"code -g {file}:{line}\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.editor(), Some("code -g {file}:{line}"));
 
-        assert_eq!(config.to_json()["editor"], "code -g {file}:{line}");
-
-        // A value naming no placeholder is valid: the path is appended to it
-        // A tightening that demanded `{file}` would block the whole file
-        // for anyone who spelled their editor the short way.
+        // A value naming no placeholder is valid: the path is appended.
         for value in ["vim", "myed --at {line}"] {
             std::fs::write(&path, format!("editor = \"{value}\"\n")).unwrap();
             let config = super::plugin_config_in(dir.path()).expect(value);
@@ -872,7 +788,6 @@ mod tests {
         std::fs::write(&path, "theme = \"tokyo-night\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.editor(), None);
-        assert!(config.to_json()["editor"].is_null());
     }
 
     #[test]
@@ -882,7 +797,6 @@ mod tests {
         std::fs::write(&path, "url_opener = \"remote-open\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.url_opener(), Some("remote-open"));
-        assert_eq!(config.to_json()["url_opener"], "remote-open");
     }
 
     #[test]
@@ -894,8 +808,7 @@ mod tests {
         assert!(error.contains(path.to_str().unwrap()));
         assert!(error.contains("unknown key `poll`"));
 
-        // The retired `base_branches` key fails like any unknown key: the base is a picked,
-        // per-repo choice now, never configuration.
+        // The retired `base_branches` key fails like any unknown key.
         std::fs::write(&path, "base_branches = [\"dev\"]\n").unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
         assert!(error.contains("unknown key `base_branches`"));
@@ -964,8 +877,7 @@ mod tests {
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.gitlab_host(), Some("git.corp.example"));
 
-        // The same hostname under two forge keys is an invalid file (CFG-WHOLE-FILE): a
-        // hostname is recognized by at most one forge.
+        // One hostname under two forge keys invalidates the file.
         std::fs::write(
             &path,
             "github_host = \"code.corp.example\"\ngitlab_host = \"code.corp.example\"\n",
@@ -987,8 +899,7 @@ mod tests {
         assert_eq!(config.azure_devops_host(), Some("tfs.corp.example"));
         assert_eq!(config.forge_hosts().azure_devops, Some("tfs.corp.example"));
 
-        // Each pair under one hostname is an invalid file (CFG-WHOLE-FILE): a hostname is
-        // recognized by at most one forge.
+        // Every pair of forge keys collides the same way.
         let pairs = [
             ("github_host", "azure_devops_host"),
             ("gitlab_host", "azure_devops_host"),
@@ -1045,8 +956,6 @@ mod tests {
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain('x')), Some(Action::ToggleReviewed));
         assert_eq!(config.keymap().action_for(Key::plain('R')), None, "the default is freed");
-        assert_eq!(config.to_json()["keybindings"]["toggle-reviewed"], serde_json::json!(["x"]));
-
         std::fs::write(&path, "[keybindings]\ntoggle-reviewed = [\"c\"]\n").unwrap();
         let error = super::plugin_config_in(dir.path()).unwrap_err().to_string();
         assert!(
@@ -1065,7 +974,6 @@ mod tests {
         std::fs::write(&path, "theme = \"catppuccin\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain(':')), Some(Action::GotoLine));
-        assert_eq!(config.to_json()["keybindings"]["goto-line"], serde_json::json!([":"]));
         std::fs::write(&path, "[keybindings]\ngoto-line = [\"L\"]\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain('L')), Some(Action::GotoLine));
@@ -1078,12 +986,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        // The default `find` chord resolves and serializes in config syntax.
+        // The default `find` chord resolves and spells in config syntax.
         std::fs::write(&path, "theme = \"catppuccin\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::ctrl('f')), Some(Action::Find));
-        let bindings = config.to_json()["keybindings"].as_object().unwrap().clone();
-        assert_eq!(bindings["find"], serde_json::json!(["ctrl+f"]));
+        assert_eq!(keys_of(&config, Action::Find), ["ctrl+f"]);
 
         // A rebind to another chord takes, and the old default frees.
         std::fs::write(&path, "[keybindings]\nfind = [\"alt+x\"]\n").unwrap();
@@ -1093,8 +1000,8 @@ mod tests {
             Some(Action::Find)
         );
         assert_eq!(config.keymap().action_for(Key::ctrl('f')), None);
-        // The `alt+` chord serializes back in config syntax, not the glyph.
-        assert_eq!(config.to_json()["keybindings"]["find"], serde_json::json!(["alt+x"]));
+        // The `alt+` chord spells back in config syntax, not the glyph.
+        assert_eq!(keys_of(&config, Action::Find), ["alt+x"]);
 
         // A malformed chord is an invalid value.
         std::fs::write(&path, "[keybindings]\nfind = [\"ctrl+\"]\n").unwrap();
@@ -1112,20 +1019,20 @@ mod tests {
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain('h')), Some(Action::Collapse));
         assert_eq!(config.keymap().action_for(Key::named(KeyCode::Left)), Some(Action::Collapse));
-        let json = config.to_json();
-        assert_eq!(json["keybindings"]["collapse"], serde_json::json!(["h", "left"]));
-        assert_eq!(json["keybindings"]["expand"], serde_json::json!(["right"]));
-        assert_eq!(json["keybindings"]["down"], serde_json::json!(["j", "down"]));
-        assert_eq!(json["keybindings"]["half-up"], serde_json::json!(["ctrl+u"]));
+        assert_eq!(keys_of(&config, Action::Collapse), ["h", "left"]);
+        assert_eq!(keys_of(&config, Action::Expand), ["right"]);
+        assert_eq!(keys_of(&config, Action::Down), ["j", "down"]);
+        assert_eq!(keys_of(&config, Action::HalfUp), ["ctrl+u"]);
 
-        // The resolved output re-parses: every emitted spelling is valid config grammar.
-        let resolved = json["keybindings"].as_object().unwrap().clone();
+        // Every key's config spelling re-parses to the same keymap.
         let toml: String = std::iter::once("[keybindings]\n".to_string())
-            .chain(resolved.iter().map(|(action, keys)| format!("{action} = {keys}\n")))
+            .chain(config.keymap().bindings().iter().map(|&(action, _)| {
+                format!("{} = {:?}\n", action.name(), keys_of(&config, action))
+            }))
             .collect();
         std::fs::write(&path, toml).unwrap();
         let reparsed = super::plugin_config_in(dir.path()).unwrap();
-        assert_eq!(reparsed.to_json()["keybindings"], json["keybindings"]);
+        assert_eq!(reparsed.keymap().bindings(), config.keymap().bindings());
 
         // The display spelling of a named key is not the config spelling.
         std::fs::write(&path, "[keybindings]\npage-up = [\"PageUp\"]\n").unwrap();
@@ -1155,12 +1062,11 @@ mod tests {
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.keymap().action_for(Key::plain('+')), Some(Action::NavigatorGrow));
         assert_eq!(config.keymap().action_for(Key::plain('-')), Some(Action::NavigatorShrink));
-        let json = config.to_json();
-        let bindings = json["keybindings"].as_object().unwrap();
-        assert!(bindings.contains_key("navigator-grow"));
-        assert!(bindings.contains_key("navigator-shrink"));
-        assert!(!bindings.contains_key("list-wider"));
-        assert!(!bindings.contains_key("list-narrower"));
+        let names: Vec<&str> = config.keymap().bindings().iter().map(|(a, _)| a.name()).collect();
+        assert!(names.contains(&"navigator-grow"));
+        assert!(names.contains(&"navigator-shrink"));
+        assert!(!names.contains(&"list-wider"));
+        assert!(!names.contains(&"list-narrower"));
 
         std::fs::write(&path, "[keybindings]\nnavigator-grow = [\"g\"]\nlist-wider = [\"h\"]\n")
             .unwrap();
@@ -1237,24 +1143,19 @@ mod tests {
     }
 
     #[test]
-    fn normalized_json_contains_every_key() {
-        let value = PluginConfig::default().to_json();
-        let object = value.as_object().unwrap();
-        assert_eq!(object.len(), super::PLUGIN_CONFIG_KEYS.len(), "one JSON key per config key");
-        assert_eq!(object["default_scope"], "uncommitted");
-        assert_eq!(object["markdown_view"], "source");
-        assert_eq!(object["navigator_position"], "right");
-        assert_eq!(object["toggle_placement"], "split");
-        assert_eq!(object["toggle_direction"], "right");
-        assert_eq!(object["auto_open"], true);
-        assert!(object["github_host"].is_null());
-        let keybindings = object["keybindings"].as_object().unwrap();
-        assert_eq!(
-            keybindings.len(),
-            crate::keymap::Action::names().count(),
-            "every action is present, resolved"
-        );
-        assert_eq!(keybindings["quit"], serde_json::json!(["q"]));
-        assert_eq!(keybindings["send"], serde_json::json!(["s", "S"]));
+    fn the_default_keymap_binds_every_action() {
+        use crate::keymap::Action;
+        let config = PluginConfig::default();
+        assert_eq!(config.keymap().bindings().len(), Action::names().count());
+        assert!(config.keymap().bindings().iter().all(|(_, keys)| !keys.is_empty()));
+        assert_eq!(keys_of(&config, Action::Quit), ["q"]);
+        assert_eq!(keys_of(&config, Action::Send), ["s", "S"]);
+    }
+
+    /// `action`'s keys in `config`, spelled as the config file spells them.
+    fn keys_of(config: &PluginConfig, action: crate::keymap::Action) -> Vec<String> {
+        let mut bindings = config.keymap().bindings().iter();
+        let keys = bindings.find(|(a, _)| *a == action).map(|(_, keys)| keys.as_slice());
+        keys.unwrap_or_default().iter().map(|k| k.config_str()).collect()
     }
 }

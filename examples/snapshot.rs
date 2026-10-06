@@ -1,13 +1,5 @@
-//! Paint reviewr's real frames, for every theme, as colored HTML: one fragment per scene and
-//! theme, so two builds can be compared side by side by eye.
-//!
-//! Usage: `cargo run --example snapshot -- <out-dir>`. Run it with the herdr environment
-//! stripped (`env -u HERDR_WORKSPACE_ID -u HERDR_PANE_ID HERDR_BIN_PATH=false`): nothing here
-//! sends, but a scene must never reach a live agent pane.
-//!
-//! Each scene is a fixture repo driven through the app's public entry points, drawn by
-//! `ui::render` into a `TestBackend`. The terminal's own background and foreground stand in as
-//! the theme's `base` and `text`, the precondition reviewr's colors are designed against.
+//! Paint reviewr's real frames per scene and theme as colored HTML, to compare two builds by eye.
+//! Usage: `cargo run --example snapshot -- <out-dir>`, with the herdr environment stripped.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -425,7 +417,7 @@ impl ExportTarget for NoClipboard {
     fn success_message(&self, _count: usize) -> String {
         String::new()
     }
-    fn failure_message(&self, _error: &anyhow::Error) -> String {
+    fn failure_message(&self, _error: &anyhow::Error, _copy: &str) -> String {
         String::new()
     }
 }

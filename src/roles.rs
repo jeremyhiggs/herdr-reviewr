@@ -1,25 +1,5 @@
-//! Semantic color roles: what a color is for, resolved per theme so it reads everywhere.
-//!
-//! A theme supplies [`Primitives`]: its background, text, six hues and its UI accent. One
-//! shared rule set derives every [`Fill`] (a layer under text) and every [`Ink`] (a color text
-//! or a glyph paints with), each ink resolved once per fill it can sit on. Components ask for
-//! a role on a fill and never see a primitive, so a theme's look and its legibility live here
-//! alone. Rules, in order:
-//!
-//! - A fill is a step or a tint off `base`. It softens toward `base` until body text reads on it,
-//!   but never into `base`: it stays visibly a layer over every fill beneath it. The match
-//!   highlight and the caret are solid: they must be found at a glance, so they never soften.
-//! - Body text that still falls short lifts toward the contrast pole, on that fill only. On a
-//!   fill bright enough that the theme's background reads better than its text, text takes the
-//!   background's side and the opposite pole.
-//! - The secondary and muted tiers sit at fixed shares of the text's contrast, floored at their
-//!   minimums, so the three tiers keep their order and a visible step on every fill.
-//! - A colored ink keeps its official color wherever it clears its floor, and lifts toward the
-//!   pole on the fills where it doesn't.
-//! - Roles that can appear side by side keep a minimum perceptual distance: the lower-priority
-//!   one takes the theme's next candidate hue.
-//! - Content colors (syntax, a theme's markdown headings) keep their hue on a fill and move in
-//!   lightness only, as far as legibility needs.
+//! Color roles: a theme's [`Primitives`] derive every [`Fill`] and every [`Ink`], each ink
+//! resolved per fill it sits on, so components never see a primitive.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -119,9 +99,8 @@ pub const FILLS: [Fill; 12] = [
     Fill::RemovedEmph,
 ];
 
-/// The fills in layers, derived bottom up. Every fill stays visibly apart from every fill in
-/// another layer, so whatever the UI stacks — a match on a diff row, the cursor over a picked
-/// range, a selection over emphasis — reads as a layer. Fills in one layer never stack.
+/// The fills in layers, derived bottom up; each stays visibly apart from every other layer's,
+/// so anything the UI stacks reads as a layer. Fills in one layer never stack.
 pub const LAYERS: [&[Fill]; 7] = [
     &[Fill::Base],
     &[Fill::Bar, Fill::Code],
@@ -237,11 +216,8 @@ impl Palette {
         self.mark[ink as usize][on as usize]
     }
 
-    /// A content color — syntax, a theme's markdown heading — painted on `on`, as legible there
-    /// as it is on the plain background (capped at [`TEXT_FLOOR`]), its hue kept. A text tier
-    /// resolved on the background resolves as that tier on `on`, so rendered markdown's body,
-    /// secondary and muted text and its rules keep their order there. Non-RGB colors are the
-    /// terminal's own defaults and pass through.
+    /// A content color on `on`, as legible as on the background (capped at [`TEXT_FLOOR`]), hue
+    /// kept; a text tier stays its tier, and terminal defaults pass through.
     #[must_use]
     pub fn legible(&self, fg: Color, on: Fill) -> Color {
         if on == Fill::Base || !matches!(fg, Color::Rgb(..)) {
@@ -263,9 +239,8 @@ impl Palette {
         self.lifted(fg, on, TEXT_FLOOR)
     }
 
-    /// `fg` lifted on `on` to `target`, the way every colored role is ([`hued`]). The answer
-    /// depends only on the colors, so it is memoized: a frame repaints the same few syntax
-    /// colors on the same few fills thousands of times.
+    /// `fg` lifted on `on` to `target` like every colored role ([`hued`]), memoized: a frame
+    /// repaints the same few colors on the same few fills thousands of times.
     fn lifted(&self, fg: Color, on: Fill, target: f64) -> Color {
         thread_local! {
             static MEMO: RefCell<HashMap<(Color, Color, u64), Color>> =
@@ -288,9 +263,7 @@ impl Palette {
         })
     }
 
-    /// Recede a painted color behind an open modal: halfway to `base`, so the modal owns the
-    /// eye while the page behind stays recognizable. Non-RGB colors are the terminal's own
-    /// defaults, which have no known distance to `base`; they pass through.
+    /// Recede a color halfway to `base` behind a modal; terminal defaults pass through.
     #[must_use]
     pub fn scrim(&self, color: Color) -> Color {
         match color {
@@ -342,12 +315,8 @@ struct Hues {
 }
 
 impl Hues {
-    /// Resolve in priority order: the diff and status hues are fixed, then `comment`, then
-    /// `accent`, then `merged`, each taking its first candidate that keeps [`INK_SEP`] from
-    /// every role it can appear beside. `comment` also steers clear of the theme's own accent,
-    /// so your comments never wear the color that marks focus; the accent then moves only when
-    /// it collides with a diff hue. `merged` stands apart from the PR number's accent and from
-    /// your pending comments in the footer.
+    /// Diff and status hues fixed, then `comment`, `accent`, `merged`, each the first candidate
+    /// [`INK_SEP`] from every role beside it; `comment` also avoids the focus accent.
     fn resolve(p: &Primitives) -> Self {
         let (added, removed, modified) = (p.green, p.red, p.yellow);
         let pick = |candidates: &[Color], taken: &[Color]| first_distinct(p, candidates, taken);
@@ -403,10 +372,8 @@ enum Recipe {
     Tint { toward: Color, start: f64 },
 }
 
-/// Every fill: overrides as given, the rest derived layer by layer, bottom up. A tinted fill
-/// starts at its strength and softens toward `base` until body text clears its target, no
-/// further than [`MIN_STRENGTH`] of the start. Then it strengthens, if it must, until it reads
-/// as a layer over every fill below it; body text lifts on it instead.
+/// Every fill, bottom up: a tint softens toward `base` until body text reads (to [`MIN_STRENGTH`]),
+/// then strengthens until it reads as a layer over every fill below; overrides as given.
 fn derive_fills(p: &Primitives, hues: &Hues, o: &Overrides) -> [Color; FILLS.len()] {
     let mut fills = [p.base; FILLS.len()];
     for (depth, layer) in LAYERS.iter().enumerate() {
@@ -508,10 +475,8 @@ fn fade(fg: Color, bg: Color, target: f64) -> Color {
     blend(fg, bg, keep)
 }
 
-/// `fg` moved in `OKLab` lightness only, lighter or darker, just far enough to clear `min` on
-/// `bg`. Its hue stays: chroma gives way only where the lighter color would leave sRGB. A pole
-/// blend washes a color toward gray instead, which a syntax token on a light cursor row can't
-/// afford.
+/// `fg` moved in `OKLab` lightness only, just far enough to clear `min` on `bg`, hue kept: a pole
+/// blend would wash a syntax token toward gray.
 fn lift_lightness(fg: Color, bg: Color, lighter: bool, min: f64) -> Color {
     if contrast(fg, bg) >= min {
         return fg;

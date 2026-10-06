@@ -1,5 +1,4 @@
-//! The rebindable action keymap: action names, default keys, resolution of `[keybindings]`
-//! overrides, and the key → action lookup the dispatcher and the hint renderers share
+//! The rebindable keymap: actions, default keys, `[keybindings]` overrides, and the lookup.
 
 use std::sync::LazyLock;
 
@@ -50,13 +49,11 @@ pub enum Action {
     OpenPr,
     Refresh,
     Quit,
-    /// The quit question's answer: quit and drop the unsent comments. A key of its own, so a
-    /// held quit key's auto-repeat can never answer the question it just raised.
+    /// Quit and drop unsent comments; its own key, so a held `q` can't answer its own question.
     QuitDiscard,
 }
 
-/// A key's base: a printable character, or one of the named keys from the `[keybindings]`
-/// grammar.
+/// A key's base: a printable character or a named key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyCode {
     Char(char),
@@ -69,8 +66,7 @@ pub enum KeyCode {
 }
 
 impl KeyCode {
-    /// Every named key, the one list `by_name` and `names` derive from. The spellings live in
-    /// the exhaustive `name`/`label` matches, so a new variant cannot compile unspelled.
+    /// Every named key, the one list `by_name` and `names` derive from.
     const NAMED: [KeyCode; 6] =
         [Self::Left, Self::Right, Self::Up, Self::Down, Self::PageUp, Self::PageDown];
 
@@ -111,8 +107,7 @@ impl KeyCode {
     }
 }
 
-/// One bound key: a base [`KeyCode`], alone or under a `ctrl`/`alt` modifier. A modifier-less
-/// `Key` is the bare character the keymap answered before chords existed
+/// One bound key: a [`KeyCode`], alone or under `ctrl` or `alt`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Key {
     pub ctrl: bool,
@@ -145,22 +140,18 @@ impl Key {
         }
     }
 
-    /// The spelling `[keybindings]` and `--resolve-plugin-config` round-trip: `ctrl+f`,
-    /// `alt+x`, the bare character, or a named key's lowercase name.
-    /// There is deliberately no `Display` impl: a call site must pick this or [`Self::label`].
+    /// The config spelling (`ctrl+f`, `pageup`); no `Display`, so callers pick this or `label`.
     pub fn config_str(self) -> String {
         self.prefixed(self.code.name())
     }
 
-    /// The hint the footer and header paint: the config spelling, except a named key shows
-    /// its screen label — `→`, `PageUp`.
+    /// The painted hint: the config spelling, a named key as its label (`→`, `PageUp`).
     pub fn label(self) -> String {
         self.prefixed(self.code.label())
     }
 }
 
-/// Every action with its config name and default keys — the single source the default keymap,
-/// the name lookup, and the config error message are built from.
+/// Every action with its config name and default keys, the one table the keymap derives from.
 const ACTIONS: [(Action, &str, &[Key]); 45] = [
     (Action::Down, "down", &[Key::plain('j'), Key::named(KeyCode::Down)]),
     (Action::Up, "up", &[Key::plain('k'), Key::named(KeyCode::Up)]),
@@ -236,10 +227,7 @@ impl Action {
     }
 }
 
-/// One resolved keymap: every action with its bound keys, never empty per action. Built from
-/// the defaults, or from the defaults with `[keybindings]` overrides applied ([`resolve`]).
-///
-/// [`resolve`]: Keymap::resolve
+/// Every action with at least one key: the defaults, overridden by `[keybindings]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Keymap {
     bindings: Vec<(Action, Vec<Key>)>,
@@ -253,17 +241,14 @@ impl Default for Keymap {
     }
 }
 
-/// The default keymap, shared by the callers that need one without a validated snapshot: the
-/// blocked `App`'s total `keymap()` accessor and the event loop's error-gate `quit` check.
+/// The default keymap, for callers with no valid config.
 pub fn default_keymap() -> &'static Keymap {
     static DEFAULT: LazyLock<Keymap> = LazyLock::new(Keymap::default);
     &DEFAULT
 }
 
 impl Keymap {
-    /// Apply `[keybindings]` overrides to the defaults. An overridden action answers exactly its
-    /// configured keys; every other action keeps its defaults. A key bound twice anywhere is a
-    /// collision; the error detail names each action involved.
+    /// Apply overrides to the defaults; a key bound twice is an error naming both actions.
     pub fn resolve(overrides: &[(Action, Vec<Key>)]) -> Result<Self, String> {
         let mut keymap = Self::default();
         for (action, keys) in overrides {
@@ -304,7 +289,7 @@ impl Keymap {
     }
 
     /// Every action with its bound keys, in keymap-table order.
-    #[must_use]
+    #[cfg(test)]
     pub(crate) fn bindings(&self) -> &[(Action, Vec<Key>)] {
         &self.bindings
     }

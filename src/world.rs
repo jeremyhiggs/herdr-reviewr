@@ -1,62 +1,46 @@
-//! The world snapshot: the derived state one refresh produces, built from git alone.
-//!
-//! `build` reads nothing from `App`, so the same call runs synchronously (startup, scope
-//! switches, first visits) and behind the worker (polls, `r`, return visits)
-//! Reconciling a snapshot into place state stays
-//! in `App::reconcile_world`, the one home for the Continuity rules.
+//! The world snapshot: what one refresh derives from git alone, built on the caller or the worker.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender};
 
 use anyhow::{Context, Result, bail};
 
 use crate::app::Tab;
-use crate::file_list::{Annotation, Entry};
+use crate::file_list::Entry;
 use crate::git;
 use crate::herdr::AgentSample;
 use crate::model::{ChangedFile, CommitPick, ReviewContext, Scope};
 use crate::turn::{TurnTracker, WorktreeState};
 
-/// Everything the build reads. A landed snapshot reconciles only while the view still
-/// matches the input that produced it.
+/// Everything the build reads; a snapshot lands only while the view still matches it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WorldInput {
     pub repo: PathBuf,
     pub tab: Tab,
     pub scope: Scope,
-    /// The `--base` flag, resolved fresh per build. The pick is read from its ref at build
-    /// time, so it is derived output, never input identity — a pick made in another pane
-    /// of this worktree must land here as newer content, not be discarded as a mismatch.
+    /// The `--base` flag. The pick is read at build time, so another pane's pick lands as content.
     pub base: Option<String>,
-    /// Bumped by this pane's own pick, so a build that read the previous pick fails the
-    /// landing's input-equality gate instead of reverting the picked base. Another pane's
-    /// pick leaves it alone — see `base` above.
+    /// Bumped by this pane's pick, so a build of the previous pick never lands.
     pub base_epoch: u64,
     /// The `last-turn` baseline tree the changed set diffs against; `None` before a turn.
     pub turn_baseline: Option<String>,
-    /// The `commits` scope's pick. Part of the identity, so a build for a replaced pick
-    /// fails the landing gate instead of painting the old run.
+    /// The `commits` scope's pick, so a build of a replaced pick never lands.
     pub commit_pick: Option<CommitPick>,
     /// Expanded ignored directories whose children the `All files` tree loads.
     pub toggled_dirs: HashSet<String>,
 }
 
-/// The derived state one refresh produces: the scope changeset, the navigator entries, and
-/// the `branch` scope's resolved base. The base rides the snapshot so the header name and
-/// the changeset it heads land whole, from one build.
+/// One refresh's result; the base rides along so the header and its changeset land together.
 #[derive(Debug)]
 pub struct WorldSnapshot {
-    /// The authored-review namespace derived in the same build as `changed`.
     pub review_context: ReviewContext,
-    pub changed: HashMap<String, Annotation>,
+    pub changeset: Changeset,
     pub entries: Vec<Entry>,
     pub branch_base: git::BaseStatus,
-    /// The `commits` scope's pick verdict, from the same build as the changeset it heads
-    /// `None` on every other scope.
+    /// The `commits` scope's pick verdict; `None` on every other scope.
     pub pick_status: Option<PickStatus>,
-    /// The commit `HEAD` named when the build ran, the commit picker's universe key
-    /// `None` in an unborn repository.
+    /// `HEAD` at build time, the commit picker's key; `None` when unborn.
     pub head: Option<String>,
 }
 
@@ -80,19 +64,31 @@ pub struct PickStatus {
     pub count: usize,
 }
 
-/// The scope-dependent half of a build: the changeset and the base or pick it diffs against,
-/// landed together so the header and the list never disagree.
-#[derive(Debug)]
+/// The ends a changeset was diffed between (`new` `None` for the worktree); a file's diff reads these.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffEnds {
+    pub old: String,
+    pub new: Option<String>,
+}
+
+/// A scope's changed files by path and the ends they were diffed between, landed together.
+#[derive(Debug, Default)]
+pub struct Changeset {
+    pub files: BTreeMap<String, ChangedFile>,
+    /// `None` when the scope has nothing to diff: no baseline, base, or live pick.
+    pub ends: Option<DiffEnds>,
+}
+
+/// A build's changeset and the base or pick it diffs against, landed together.
+#[derive(Debug, Default)]
 pub struct ScopeBuild {
     pub review_context: ReviewContext,
     pub branch_base: git::BaseStatus,
     pub pick_status: Option<PickStatus>,
-    pub changed: Vec<ChangedFile>,
+    pub changeset: Changeset,
 }
 
-/// Whether this input is intentionally outside Git. `App` holds the resolved worktree root once
-/// startup has found one, so a `.git` marker with a failed probe is an established repository we
-/// failed to read, not a new non-repository directory. Preserve the last good world in that case.
+/// Distinguish a directory outside Git from an established repository that temporarily failed.
 fn repository_available(repo: &Path) -> Result<bool> {
     match git::worktree_of(repo) {
         git::Worktree::Root(_) => Ok(true),
@@ -106,101 +102,122 @@ fn repository_available(repo: &Path) -> Result<bool> {
     }
 }
 
-/// Build the snapshot for `input`. The changeset is computed regardless of tab so the
-/// header count and comment staleness stay correct while `All files` lists the whole
-/// worktree. In `last-turn` with no baseline yet, the changeset is empty until a turn
-/// start is observed.
+/// Build the snapshot for `input`; the changeset is built on every tab.
 pub fn build(input: &WorldInput) -> Result<WorldSnapshot> {
-    // Outside a git repo, an empty snapshot paints the quiet empty state rather than a
-    // failing status line every poll.
+    build_at(input, None)
+}
+
+/// [`build`], reusing `written`, a worktree tree written this instant, as `last-turn`'s new end.
+fn build_at(input: &WorldInput, written: Option<String>) -> Result<WorldSnapshot> {
+    // Outside a repo, paint the quiet empty state, not an error every poll.
     if !repository_available(&input.repo)? {
         return Ok(WorldSnapshot {
             review_context: context_without_git(input),
-            changed: HashMap::new(),
+            changeset: Changeset::default(),
             entries: Vec::new(),
             branch_base: git::BaseStatus::default(),
             pick_status: None,
             head: None,
         });
     }
-    let ScopeBuild { review_context, branch_base, pick_status, changed } = build_changed(input)?;
+    // One read of HEAD serves the snapshot and the uncommitted diff's old end.
     let head = git::head_oid(&input.repo);
-    let changed_map = annotate(&changed);
+    let ScopeBuild { review_context, branch_base, pick_status, changeset } =
+        scope_build(input, head.clone(), written)?;
     let entries = match input.tab {
         // The whole worktree (ignored included), with expanded ignored dirs loaded lazily.
-        Tab::AllFiles => all_files_entries(input, &changed_map)?,
+        Tab::AllFiles => all_files_entries(input, &changeset.files)?,
         // `Changes` (the `PR` tab never builds a snapshot).
-        _ => changed.iter().map(Entry::from_changed).collect(),
+        _ => changeset.files.values().map(Entry::from_changed).collect(),
     };
-    Ok(WorldSnapshot {
-        review_context,
-        changed: changed_map,
-        entries,
-        branch_base,
-        pick_status,
-        head,
-    })
+    Ok(WorldSnapshot { review_context, changeset, entries, branch_base, pick_status, head })
 }
 
-/// The active scope's changed files and, on the `branch` scope, the base they diff against —
-/// the piece a scope switch rebuilds before its frame, so the header count and list never
-/// wear another scope's label.
+/// The active scope's changeset and, on `branch`, its base.
 pub fn build_changed(input: &WorldInput) -> Result<ScopeBuild> {
-    let plain = |review_context, changed| ScopeBuild {
-        review_context,
-        branch_base: git::BaseStatus::default(),
-        pick_status: None,
-        changed,
-    };
     if !repository_available(&input.repo)? {
-        return Ok(plain(context_without_git(input), Vec::new()));
+        return Ok(ScopeBuild {
+            review_context: context_without_git(input),
+            ..ScopeBuild::default()
+        });
     }
+    scope_build(input, git::head_oid(&input.repo), None)
+}
+
+/// [`build_changed`] against `head`, as the caller read it, inside a repo; `written`, a tree of
+/// the worktree written this instant, spares `last-turn` a second snapshot.
+fn scope_build(
+    input: &WorldInput,
+    head: Option<String>,
+    written: Option<String>,
+) -> Result<ScopeBuild> {
     match input.scope {
         Scope::LastTurn => match input.turn_baseline.as_deref() {
-            Some(t) => Ok(plain(
-                ReviewContext::LastTurn { baseline: Some(t.to_string()) },
-                git::changed_against_tree(&input.repo, t)?,
-            )),
-            None => Ok(plain(ReviewContext::LastTurn { baseline: None }, Vec::new())),
+            Some(t) => {
+                let now = match written {
+                    Some(tree) => tree,
+                    None => git::snapshot_worktree(&input.repo)?,
+                };
+                at_ends(
+                    &input.repo,
+                    ReviewContext::LastTurn { baseline: Some(t.to_string()) },
+                    DiffEnds { old: t.to_string(), new: Some(now) },
+                )
+            }
+            None => Ok(ScopeBuild {
+                review_context: ReviewContext::LastTurn { baseline: None },
+                ..ScopeBuild::default()
+            }),
         },
-        Scope::Uncommitted => Ok(plain(
-            ReviewContext::Uncommitted,
-            git::changed_files(&input.repo, input.scope, None)?,
-        )),
+        Scope::Uncommitted => {
+            let base = git::diff_base(head);
+            at_ends(&input.repo, ReviewContext::Uncommitted, DiffEnds { old: base, new: None })
+        }
         Scope::Branch => {
-            // A resolve failure fails the build whole, so the landing keeps the stale
-            // frame and reports — degrading to an empty snapshot would blank a populated
-            // view over a transient error (Continuity). A chain where
-            // nothing resolves is not a failure: it returns the legible no-base state.
-            let resolution = git::resolve_base(&input.repo, input.base.as_deref())
-                .map_err(|e| anyhow::anyhow!("{}", e.0))?;
-            let base_oid = resolution.status.winner.as_ref().map(|w| w.oid().to_string());
-            let changed = git::changed_files(&input.repo, input.scope, base_oid.as_deref())?;
+            // A resolve failure fails the build, keeping the stale frame.
+            let resolution = git::resolve_base(&input.repo, input.base.as_deref())?;
+            let merge_base = match resolution.status.winner.as_ref() {
+                Some(winner) => git::merge_base_checked(&input.repo, winner.oid())?,
+                None => None,
+            };
             let review_context = ReviewContext::Branch {
                 base: resolution.status.winner.as_ref().map(|winner| winner.name().to_string()),
             };
-            Ok(ScopeBuild {
-                review_context,
-                branch_base: resolution.status,
-                pick_status: None,
-                changed,
-            })
+            let build = match merge_base {
+                Some(base) => {
+                    at_ends(&input.repo, review_context.clone(), DiffEnds { old: base, new: None })?
+                }
+                None => ScopeBuild { review_context, ..ScopeBuild::default() },
+            };
+            Ok(ScopeBuild { branch_base: resolution.status, ..build })
         }
         Scope::Commits => {
-            // The scope is never entered without a pick; a tag without one
-            // builds the empty changeset rather than failing the landing.
+            // A tag without a pick builds the empty changeset.
             let Some(pick) = &input.commit_pick else {
-                return Ok(plain(ReviewContext::Commits { pick: None }, Vec::new()));
+                return Ok(ScopeBuild {
+                    review_context: ReviewContext::Commits { pick: None },
+                    ..ScopeBuild::default()
+                });
             };
-            let (status, changed) = build_pick(&input.repo, pick)?;
-            Ok(ScopeBuild {
-                review_context: ReviewContext::Commits { pick: Some(pick.clone()) },
-                branch_base: git::BaseStatus::default(),
-                pick_status: Some(status),
-                changed,
-            })
+            let mut build = build_pick(&input.repo, pick)?;
+            build.review_context = ReviewContext::Commits { pick: Some(pick.clone()) };
+            Ok(build)
         }
     }
+}
+
+/// The changeset between `ends`, carried beside them: the ends a file's diff reads are its input.
+fn at_ends(repo: &Path, review_context: ReviewContext, ends: DiffEnds) -> Result<ScopeBuild> {
+    let changed = match &ends.new {
+        None => git::changed_from(repo, &ends.old)?,
+        Some(new) => git::changed_between(repo, &ends.old, new)?,
+    };
+    let files = changed.into_iter().map(|f| (f.path.clone(), f)).collect();
+    Ok(ScopeBuild {
+        review_context,
+        changeset: Changeset { files, ends: Some(ends) },
+        ..ScopeBuild::default()
+    })
 }
 
 fn context_without_git(input: &WorldInput) -> ReviewContext {
@@ -212,19 +229,15 @@ fn context_without_git(input: &WorldInput) -> ReviewContext {
     }
 }
 
-/// The pick's changeset and verdict in one pass: `gone`
-/// once any needed commit, `A^` included, is pruned, else `off branch` once any is
-/// unreachable from `HEAD`, else live. A `gone` pick has an empty changeset.
-fn build_pick(repo: &Path, pick: &CommitPick) -> Result<(PickStatus, Vec<ChangedFile>)> {
+/// The pick's changeset, verdict and ends in one pass; a `gone` pick has neither.
+fn build_pick(repo: &Path, pick: &CommitPick) -> Result<ScopeBuild> {
     let gone = |sha: &str| {
-        (
-            PickStatus {
-                verdict: PickVerdict::Gone(sha.to_string()),
-                subject: String::new(),
-                count: 0,
-            },
-            Vec::new(),
-        )
+        let status = PickStatus {
+            verdict: PickVerdict::Gone(sha.to_string()),
+            subject: String::new(),
+            count: 0,
+        };
+        ScopeBuild { pick_status: Some(status), ..ScopeBuild::default() }
     };
     if !git::commit_exists(repo, &pick.newest) {
         return Ok(gone(&pick.newest));
@@ -237,39 +250,33 @@ fn build_pick(repo: &Path, pick: &CommitPick) -> Result<(PickStatus, Vec<Changed
     }
     let subject = git::commit_subject(repo, &pick.newest).unwrap_or_default();
     let count = git::run_length_from(repo, &old, &pick.oldest, &pick.newest).unwrap_or(0);
-    let changed = git::changed_between(repo, &old, &pick.newest)?;
+    let at = at_ends(
+        repo,
+        ReviewContext::Commits { pick: Some(pick.clone()) },
+        DiffEnds { old, new: Some(pick.newest.clone()) },
+    )?;
     // The oldest is an ancestor of the newest, so one reachability check covers the run.
     let verdict = if git::is_reachable(repo, &pick.newest) {
         PickVerdict::Live
     } else {
         PickVerdict::OffBranch
     };
-    Ok((PickStatus { verdict, subject, count }, changed))
+    Ok(ScopeBuild { pick_status: Some(PickStatus { verdict, subject, count }), ..at })
 }
 
-/// The changed-files map every consumer keys by path — one construction site, shared by
-/// the worker build and the scope switch's synchronous rebuild.
-pub fn annotate(changed: &[ChangedFile]) -> HashMap<String, Annotation> {
-    changed.iter().map(|f| (f.path.clone(), Annotation::from(f))).collect()
-}
-
-/// The persisted turn baseline for `repo`, if any — the one seeding rule, shared by the
-/// worker's tracker and the app's first-frame mirror.
+/// The persisted turn baseline for `repo`, if any.
 pub fn seed_baseline(repo: &std::path::Path) -> Option<String> {
     git::read_baseline_ref(repo)
 }
 
-/// The `All files` entries: every worktree path (ignored dimmed), with the children of
-/// expanded ignored directories loaded lazily. Only directories the
-/// user has expanded are walked, so the cost tracks what is on screen, not the whole tree.
+/// The `All files` entries; an ignored directory is walked only once expanded.
 pub(crate) fn all_files_entries(
     input: &WorldInput,
-    changed: &HashMap<String, Annotation>,
+    changed: &BTreeMap<String, ChangedFile>,
 ) -> Result<Vec<Entry>> {
     let to_entry = |w: git::WorktreeEntry| Entry {
         annotation: changed.get(&w.path).cloned(),
         path: w.path,
-        previous_path: None,
         ignored: w.ignored,
         is_dir: w.is_dir,
     };
@@ -286,53 +293,45 @@ pub(crate) fn all_files_entries(
     Ok(entries)
 }
 
-/// Turn tracking, owned by the worker: the sample, the snapshot capture, and the baseline
-/// promotion happen on one thread, so the snapshot always rides the sample that observed the
-/// edge. The baseline ref is this worktree's last-turn write.
+/// Turn tracking on the worker, so a snapshot always rides the sample that saw its edge.
 #[derive(Debug)]
 pub struct TurnHost {
     tracker: TurnTracker,
     repo: PathBuf,
-    /// Each agent `cwd` resolved to whether it is a member of the reviewed worktree. Only a
-    /// resolved git top level is recorded, since a worktree root does not move, so a member is
-    /// placed once and never re-queried. A cwd git reports outside every worktree is not cached:
-    /// re-checking it is cheap, and a directory can become a worktree later. A cwd git could not
-    /// run for is not cached either, and holds the poll rather than counting the agent out, so a
-    /// transient failure never poisons a member for the session.
+    /// The reviewed worktree's [`canonical`] root, which a member's top level equals.
+    root: PathBuf,
+    /// Each agent `cwd` with a resolved top level, mapped to whether it is a member.
     resolved: HashMap<String, bool>,
 }
 
-/// One sample's outcome, sent back with the completion: whether it ended a turn (the `PR`
-/// tab's refetch signal), and what this sample saw of the worktree's membership (the
-/// `last-turn` empty state). The baseline itself rides the completion's input.
-#[derive(Clone, Debug)]
+/// One sample's outcome: whether a turn ended, and whether agents are present.
+#[derive(Clone, Debug, Default)]
 pub struct TurnReport {
     pub ended: bool,
-    /// `None` when the sample could not observe the whole worktree, so the reader keeps whatever
-    /// it already knew: either the enumeration failed, or a member's directory would not resolve
-    /// this poll. Membership is held on the one consumer that paints it, never mirrored here
+    /// `None` when the enumeration failed or a member didn't resolve, so the reader keeps what it knew.
     pub agents_present: Option<bool>,
+    /// The worktree tree the sample wrote, which its job's `last-turn` build reuses.
+    pub written: Option<String>,
 }
 
-/// An agent's relationship to the reviewed worktree, as [`TurnHost::membership`] resolves it.
-/// `Unknown` is not `NotMember`: it means git could not resolve the cwd this poll, so the fold
-/// holds on it rather than counting the agent out.
+/// An agent's place in the worktree; `Unknown` holds the poll instead of counting it out.
 enum Membership {
     Member,
     NotMember,
     Unknown,
 }
 
-/// The absolute cwd an agent names, or `None` for a blank or relative one. `git -C` resolves a
-/// relative directory against reviewr's own cwd, which is normally the reviewed worktree, so a
-/// relative cwd would be wrongly admitted as a member.
+/// The agent's cwd when absolute: `git -C` would resolve a relative one against reviewr's own.
 fn worktree_cwd(cwd: Option<&str>) -> Option<&str> {
     cwd.filter(|c| Path::new(c).is_absolute())
 }
 
-/// Fold the members' statuses into the worktree's work state and whether any member is present,
-/// or `None` if a member's membership was undetermined — the caller then holds the sample.
-/// Pure over the `member` resolver so the fold-and-hold rule is unit-testable without git.
+/// `path` as the OS resolves it, so two spellings of one directory compare equal.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Fold the members' statuses, or `None` when any membership is undetermined.
 fn classify(
     samples: &[AgentSample],
     mut member: impl FnMut(&AgentSample) -> Membership,
@@ -349,45 +348,36 @@ fn classify(
 }
 
 impl TurnHost {
-    /// Resume any persisted turn baseline for this worktree, so `last-turn` keeps its
-    /// anchor across a reviewr pane restart.
-    /// `repo` must already be the git top level, as [`crate::world::seed_baseline`] and
-    /// membership both compare against it. `run` resolves it once for both (`src/lib.rs`).
+    /// Resume the persisted baseline of `repo`, which must be the git top level.
     pub fn open(repo: PathBuf) -> Self {
         let tracker = TurnTracker::with_baseline(seed_baseline(&repo));
-        Self { tracker, repo, resolved: HashMap::new() }
+        Self { tracker, root: canonical(&repo), repo, resolved: HashMap::new() }
     }
 
     pub fn baseline(&self) -> Option<&str> {
         self.tracker.baseline()
     }
 
-    /// Sample the agents over the herdr CLI and advance the baseline. A missing herdr is
-    /// normal, so a failed enumeration only logs and changes nothing.
+    /// Sample the agents over the herdr CLI and advance the baseline.
     pub fn sample(&mut self) -> TurnReport {
         self.observe_agents(crate::herdr::agent_samples().ok().as_deref())
     }
 
-    /// Advance the baseline from one enumeration — the core [`Self::sample`] wraps, and the
-    /// seam tests drive without herdr. `None` is a failed enumeration, which holds the
-    /// previous membership rather than reporting an empty worktree.
+    /// Advance the baseline from one enumeration; `None`, a failed one, holds the last state.
     pub fn observe_agents(&mut self, samples: Option<&[AgentSample]>) -> TurnReport {
         let Some(samples) = samples else {
-            return TurnReport { ended: false, agents_present: None };
+            return TurnReport::default();
         };
-        // A member whose membership git could not determine leaves the sample incomplete, so
-        // hold it exactly as a failed enumeration rather than reading an unresolved member as
-        // an empty worktree.
+        // An unresolved member holds the sample, as a failed enumeration does.
         let Some((present, state)) = classify(samples, |s| self.membership(s.cwd.as_deref()))
         else {
-            return TurnReport { ended: false, agents_present: None };
+            return TurnReport::default();
         };
-        let ended = self.observe(state);
-        TurnReport { ended, agents_present: Some(present) }
+        let (ended, written) = self.observe(state);
+        TurnReport { ended, agents_present: Some(present), written }
     }
 
-    /// An agent's relationship to the reviewed worktree. The git top level is authoritative, so
-    /// a subdirectory is a member and a second worktree of the same repository is not
+    /// An agent's place by git top level: a subdirectory is a member, a sibling worktree is not.
     fn membership(&mut self, cwd: Option<&str>) -> Membership {
         let Some(cwd) = worktree_cwd(cwd) else {
             return Membership::NotMember;
@@ -396,56 +386,51 @@ impl TurnHost {
             return if member { Membership::Member } else { Membership::NotMember };
         }
         match git::worktree_of(Path::new(cwd)) {
-            // A resolved root is stable, so record whether it is a member and never shell out
-            // for this cwd again. git canonicalizes it, so the worktree root itself matches too.
+            // A resolved root never moves, so it is cached.
             git::Worktree::Root(top) => {
-                let member = top == self.repo;
+                let member = canonical(&top) == self.root;
                 self.resolved.insert(cwd.to_string(), member);
                 if member { Membership::Member } else { Membership::NotMember }
             }
-            // git ran and found no worktree. A determination, but not a stable one, so it is
-            // re-checked next poll rather than cached.
+            // Not cached: a directory can become a worktree later.
             git::Worktree::Outside => Membership::NotMember,
-            // git could not run, so nothing is known this poll. Hold rather than count the agent
-            // out, exactly as a failed enumeration does.
+            // git could not run: hold, as a failed enumeration does.
             git::Worktree::Unknown => Membership::Unknown,
         }
     }
 
-    /// Advance the baseline from one folded worktree state, returning whether a turn ended.
-    /// On a turn start it snapshots the worktree as the candidate; while a candidate is
-    /// pending it promotes once the worktree diverges from it, persisting the new baseline.
-    /// Git errors only log, so a transient git failure never crashes the poll.
-    fn observe(&mut self, state: WorktreeState) -> bool {
+    /// Advance the baseline from one worktree state: whether a turn ended, and the tree written.
+    fn observe(&mut self, state: WorktreeState) -> (bool, Option<String>) {
         let transition = self.tracker.observe(state);
         if transition.started {
             match git::snapshot_worktree(&self.repo) {
-                // The candidate is this worktree as of a moment ago, so it cannot have
-                // diverged from it yet. The next poll runs the check, which is what makes
-                // this an early return rather than a second snapshot of the same tree.
+                // A fresh candidate cannot have diverged yet; the next poll checks.
                 Ok(sha) => {
-                    self.tracker.set_candidate(sha);
-                    return transition.ended;
+                    self.tracker.set_candidate(sha.clone());
+                    return (transition.ended, Some(sha));
                 }
                 Err(e) => logln!("turn snapshot failed: {e}"),
             }
         }
-        // Promote the pending candidate once the turn has changed a file. Compare full
-        // snapshots so a new untracked file counts as a change.
+        // Full snapshots compare, so a new untracked file counts as a change.
         let Some(candidate) = self.tracker.candidate().map(str::to_string) else {
-            return transition.ended;
+            return (transition.ended, None);
         };
         match git::snapshot_worktree(&self.repo) {
-            Ok(now) if now != candidate => {
-                self.tracker.promote();
-                if let Err(e) = git::write_baseline_ref(&self.repo, &candidate) {
-                    logln!("turn baseline ref write failed: {e}");
+            Ok(now) => {
+                if now != candidate {
+                    self.tracker.promote();
+                    if let Err(e) = git::write_baseline_ref(&self.repo, &candidate) {
+                        logln!("turn baseline ref write failed: {e}");
+                    }
                 }
+                (transition.ended, Some(now))
             }
-            Ok(_) => {}
-            Err(e) => logln!("turn divergence check failed: {e}"),
+            Err(e) => {
+                logln!("turn divergence check failed: {e}");
+                (transition.ended, None)
+            }
         }
-        transition.ended
     }
 }
 
@@ -458,23 +443,18 @@ pub struct WorldRequest {
     pub reveal: bool,
 }
 
-/// One refresh request. The worker builds against `input`, refreshing its `turn_baseline`
-/// from the sample first, and echoes the tag back with the completion.
+/// One refresh request; the completion echoes its tag.
 #[derive(Debug)]
 pub struct WorldJob {
     pub generation: u64,
     pub input: WorldInput,
-    /// Poll-driven requests sample the agents in the worktree; tab entry and `r` do not,
-    /// so the herdr CLI call count tracks the poll alone.
+    /// Only polls sample the agents, so herdr calls track the poll alone.
     pub sample_turn: bool,
-    /// A user-initiated switch re-reveals the cursor when its result lands; a poll never
-    /// does.
+    /// Whether the result re-reveals the cursor: a user's switch does, a poll never.
     pub reveal: bool,
 }
 
-/// A finished job: the tag it was built for, the sample's outcome (`None` when the job
-/// didn't sample — a tab entry or `r`, not a poll), and the snapshot — `None` when the
-/// input's tab builds no file tree (the `PR` tab).
+/// A finished job; no turn without a sample, no snapshot on the `PR` tab.
 #[derive(Debug)]
 pub struct WorldCompletion {
     pub generation: u64,
@@ -484,9 +464,7 @@ pub struct WorldCompletion {
     pub snapshot: Option<Result<WorldSnapshot>>,
 }
 
-/// Run the world worker until the request channel closes. The latest request wins: queued
-/// requests coalesce into the newest, keeping any superseded job's sample and reveal flags
-/// so a poll's status sample is never skipped.
+/// Run the world worker; queued requests coalesce into the newest, keeping their flags.
 pub fn spawn(
     mut host: TurnHost,
     rx: Receiver<WorldJob>,
@@ -495,6 +473,7 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("world".into())
         .spawn(move || {
+            git::sweep_dead_copies(&host.repo);
             while let Ok(mut job) = rx.recv() {
                 while let Ok(next) = rx.try_recv() {
                     job = WorldJob {
@@ -504,21 +483,26 @@ pub fn spawn(
                     };
                 }
                 let turn = job.sample_turn.then(|| host.sample());
-                job.input.turn_baseline = host.baseline().map(str::to_string);
-                let snapshot = job.input.tab.is_file_tab().then(|| build(&job.input));
-                let completion = WorldCompletion {
-                    generation: job.generation,
-                    input: job.input,
-                    reveal: job.reveal,
-                    turn,
-                    snapshot,
-                };
-                if tx.send(completion).is_err() {
+                if tx.send(complete(&host, job, turn)).is_err() {
                     break;
                 }
             }
         })
         .expect("spawn world worker")
+}
+
+/// Finish `job` after its sample, `turn`: the build reuses the worktree tree that sample wrote.
+fn complete(host: &TurnHost, mut job: WorldJob, turn: Option<TurnReport>) -> WorldCompletion {
+    job.input.turn_baseline = host.baseline().map(str::to_string);
+    let written = turn.as_ref().and_then(|t| t.written.clone());
+    let snapshot = job.input.tab.is_file_tab().then(|| build_at(&job.input, written));
+    WorldCompletion {
+        generation: job.generation,
+        input: job.input,
+        reveal: job.reveal,
+        turn,
+        snapshot,
+    }
 }
 
 #[cfg(test)]
@@ -527,25 +511,77 @@ mod tests {
     use crate::herdr::AgentSample;
     use crate::turn::{Status, WorktreeState};
 
+    #[test]
+    fn a_last_turn_build_reuses_the_tree_its_sample_wrote() {
+        let (dir, git) = crate::test_support::test_repo();
+        let crate::git::Worktree::Root(root) = crate::git::worktree_of(dir.path()) else {
+            panic!("a fresh repository resolves to a worktree root");
+        };
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+        let baseline = crate::git::snapshot_worktree(&root).unwrap();
+        crate::git::write_baseline_ref(&root, &baseline).unwrap();
+        std::fs::write(root.join("a.txt"), "two\n").unwrap();
+        let mut host = super::TurnHost::open(root.clone());
+        // A resting sample, then a working one: the turn's start snapshots the worktree.
+        host.observe_agents(Some(&[]));
+        let turn = host.observe_agents(Some(&[working_at(&root.to_string_lossy())]));
+        std::fs::write(root.join("b.txt"), "later\n").unwrap();
+        let job = |generation| super::WorldJob {
+            generation,
+            input: super::WorldInput {
+                repo: root.clone(),
+                tab: crate::app::Tab::Changes,
+                scope: crate::model::Scope::LastTurn,
+                base: None,
+                base_epoch: 0,
+                turn_baseline: None,
+                commit_pick: None,
+                toggled_dirs: std::collections::HashSet::new(),
+            },
+            sample_turn: true,
+            reveal: false,
+        };
+        let paths = |done: super::WorldCompletion| -> Vec<String> {
+            done.snapshot.unwrap().unwrap().changeset.files.into_keys().collect()
+        };
+        assert_eq!(paths(super::complete(&host, job(1), Some(turn))), ["a.txt"]);
+        // A job without a sample has no tree to reuse, so it snapshots the worktree now.
+        assert_eq!(paths(super::complete(&host, job(2), None)), ["a.txt", "b.txt"]);
+    }
+
     fn working_at(cwd: &str) -> AgentSample {
         AgentSample { cwd: Some(cwd.into()), status: Status::Working }
     }
 
     #[test]
     fn only_an_absolute_cwd_can_name_a_worktree() {
-        // A blank or relative cwd would resolve against reviewr's own cwd (the reviewed
-        // worktree), so membership must reject it before any git call.
-        assert_eq!(worktree_cwd(Some("/abs/path")), Some("/abs/path"));
+        // A blank or relative cwd is rejected before any git call.
+        let abs = if cfg!(windows) { r"C:\abs\path" } else { "/abs/path" };
+        assert_eq!(worktree_cwd(Some(abs)), Some(abs));
         assert_eq!(worktree_cwd(Some("relative/path")), None);
         assert_eq!(worktree_cwd(Some("")), None);
         assert_eq!(worktree_cwd(None), None);
     }
 
+    /// An agent whose cwd spells the root in another case is a member.
+    #[cfg(windows)]
+    #[test]
+    fn an_agent_at_the_root_in_another_case_is_a_member() {
+        let (dir, _) = crate::test_support::test_repo();
+        let crate::git::Worktree::Root(root) = crate::git::worktree_of(dir.path()) else {
+            panic!("a fresh repository resolves to a worktree root");
+        };
+        let mut host = super::TurnHost::open(root.clone());
+        let recased = root.to_string_lossy().to_ascii_uppercase();
+        assert_ne!(recased, root.to_string_lossy(), "the spelling really differs");
+        assert!(matches!(host.membership(Some(&recased)), Membership::Member));
+    }
+
     #[test]
     fn membership_decides_the_fold_and_undetermined_holds() {
-        // One working agent, resolved three ways. `Unknown` holds the sample (the caller reads
-        // this `None` exactly as a failed enumeration, never as an empty worktree); a determined
-        // verdict folds normally.
+        // One working agent, resolved three ways.
         let samples = [working_at("/w")];
         assert_eq!(classify(&samples, |_| Membership::Unknown), None);
         assert_eq!(
@@ -560,8 +596,7 @@ mod tests {
 
     #[test]
     fn one_undetermined_member_holds_even_beside_a_resolved_one() {
-        // A resolved working member does not rescue a sample that also holds an unknown one: an
-        // incomplete view of the worktree is held whole, not folded from the part that resolved.
+        // An unknown member holds the whole sample.
         let samples = [working_at("/a"), working_at("/b")];
         let held = classify(&samples, |s| match s.cwd.as_deref() {
             Some("/b") => Membership::Unknown,
@@ -572,8 +607,7 @@ mod tests {
 
     #[test]
     fn a_non_members_status_never_reaches_the_fold() {
-        // A member resting and a non-member (a sibling worktree) working. Only the member's
-        // status folds, so the worktree reads Resting, never the sibling's Working.
+        // A resting member and a working sibling: only the member's status folds.
         let samples = [
             AgentSample { cwd: Some("/mine".into()), status: Status::Idle },
             AgentSample { cwd: Some("/sibling".into()), status: Status::Working },

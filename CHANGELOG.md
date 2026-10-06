@@ -13,6 +13,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   session-only and isolated between comparisons. Existing configurations that already bind `R`
   must move that binding or rebind `toggle-reviewed`, because duplicate bindings fail validation.
 
+## [0.45.0] — 2026-10-05
+
+### Added
+- **Windows**: install, toggle, review, and send on native Windows, with the same plugin and keybindings (thanks @Gerkinfeltser, #94).
+- **Git's editor as a fallback**: with no editor variable set, `e` opens the editor in `core.editor`.
+- **Changed line endings**: a line whose only change is its ending shows a `^M` marker.
+- **Copies**: with git's copy detection on, a copied file is marked `C`, not `R`.
+
+### Changed
+- **Requires herdr 0.9.0.** The plugin actions run in the binary, so bash and jq are no longer needed at runtime.
+- **Send cap**: a send over 256 KiB on the wire refuses with a copy hint, since herdr cannot read more in time.
+- **Send failures say why**: the status names the cause, such as `claude closed` or `herdr didn't answer`, then the copy key.
+- **Index copies under `.git/reviewr/`**: reviewr lists changes and snapshots turns on its own copy of the index, so it needs write access to the git dir.
+- **A file reviewr can't read** shows a notice instead of an empty diff.
+
+### Fixed
+- **No index rewrites**: reading a diff no longer refreshes `.git/index` behind the agent's back.
+- **`last-turn` pairs the right trees**: a diff opened mid-refresh never pairs a new baseline with an old snapshot.
+- **Diffs under `core.autocrlf`**: a file whose only difference is line endings no longer shows every line changed.
+- **Line numbers after a stray CR**: a carriage return inside a line no longer shifts the diff's rows off git's numbering.
+- **Quick double toggle**: two fast presses open reviewr and then close it, and never stack two panes.
+- **PR link**: `o` opens only an http(s) pull request URL.
+- **Submodule bumps**: a moved submodule shows its old and new commit, as `git diff` does, instead of an empty diff.
+
+### Removed
+- **`--resolve-plugin-config`**: the JSON dump lost its last reader with the pane script.
+
 ## [0.44.0] — 2026-10-03
 
 ### Added

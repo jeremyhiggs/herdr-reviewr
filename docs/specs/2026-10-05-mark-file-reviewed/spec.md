@@ -22,6 +22,10 @@ Each file in the Changes navigator has one of three review states:
 - On a reviewed file, it clears the review.
 - On a reviewed-but-changed file, it accepts the new comparison.
 
+`R` is withheld when Reviewr cannot certify the exact displayed comparison, including unreadable
+files, over-budget files, lossy text or symlink paths, and dirty submodules. A later refresh can
+make the action available once the comparison is certifiable.
+
 Lowercase `r` remains refresh. The configurable action name is `toggle-reviewed`; normal
 keybinding replacement and collision validation apply.
 
@@ -48,5 +52,6 @@ Refreshes reconcile review state only after a complete current snapshot lands. A
 refresh keeps the last consistent file list and review state. If a file changes without leaving the
 changeset, its state becomes reviewed but changed.
 
-Reviewr must remain read-only apart from its existing private refs. Marking or reconciling a file
-as reviewed must not modify the worktree, index, or branches.
+Marking or reconciling a file adds no writes. Reviewr's existing refresh machinery may use its
+private refs, session index copies, and snapshot objects, but never mutates the worktree, real
+index, or branches.
