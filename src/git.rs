@@ -2393,25 +2393,34 @@ fn worktree_blob_identities(
     }
     // Keep command lines bounded while preserving one output row per input path.
     for chunk in regular.chunks(128) {
-        let mut args = vec!["hash-object"];
-        if filtered {
-            args.push("--filters");
-        } else {
-            args.push("--no-filters");
-        }
-        args.push("--");
+        let filter_arg = if filtered { "--filters" } else { "--no-filters" };
+        let mut args = vec!["hash-object", filter_arg, "--"];
         args.extend(chunk.iter().map(|(path, _, _)| *path));
-        let hashed = git(repo, &args)?;
-        let oids: Vec<&str> = hashed.lines().collect();
-        if oids.len() != chunk.len() {
-            bail!("git hash-object returned {} ids for {} paths", oids.len(), chunk.len());
-        }
-        for ((path, mode, stamp), oid) in chunk.iter().zip(oids) {
-            remember_object_format(repo, oid)?;
-            if live_identity_stamp(repo, path)? != Some(stamp.clone()) {
-                continue;
+        let hashed = git(repo, &args).ok();
+        let oids = hashed.as_deref().map(str::lines).map(Iterator::collect::<Vec<_>>);
+        if let Some(oids) = oids.filter(|oids| oids.len() == chunk.len()) {
+            for ((path, mode, stamp), oid) in chunk.iter().zip(oids) {
+                remember_object_format(repo, oid)?;
+                if live_identity_stamp(repo, path)? == Some(stamp.clone()) {
+                    out.insert((*path).to_string(), (mode.clone(), oid.to_string()));
+                }
             }
-            out.insert((*path).to_string(), (mode.clone(), oid.to_string()));
+            continue;
+        }
+        // One path can disappear while the batch is running. Retry separately so its siblings
+        // still get certified; an unreadable path stays absent from the identity map.
+        for (path, mode, stamp) in chunk {
+            let Ok(hashed) = git(repo, &["hash-object", filter_arg, "--", path]) else {
+                continue;
+            };
+            let mut lines = hashed.lines();
+            let Some(oid) = lines.next().filter(|_| lines.next().is_none()) else {
+                continue;
+            };
+            remember_object_format(repo, oid)?;
+            if live_identity_stamp(repo, path)? == Some(stamp.clone()) {
+                out.insert((*path).to_string(), (mode.clone(), oid.to_string()));
+            }
         }
     }
     Ok(out)
