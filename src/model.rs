@@ -163,6 +163,28 @@ impl FileIdentity {
         Self(std::sync::Arc::new(parts))
     }
 
+    /// The same file comparison under a newer aggregate snapshot endpoint.
+    pub(crate) fn with_new_endpoint(&self, endpoint: &str) -> Self {
+        let mut parts = (*self.0).clone();
+        parts.new_endpoint = endpoint.to_string();
+        Self(std::sync::Arc::new(parts))
+    }
+
+    /// Whether this file's two sides are unchanged, even if another file moved the snapshot tree.
+    pub(crate) fn same_file_comparison(&self, other: &Self) -> bool {
+        let (a, b) = (&self.0, &other.0);
+        a.old_endpoint == b.old_endpoint
+            && a.kind == b.kind
+            && a.path == b.path
+            && a.previous_path == b.previous_path
+            && a.old_mode == b.old_mode
+            && a.new_mode == b.new_mode
+            && a.old_content == b.old_content
+            && a.new_content == b.new_content
+            && a.binary == b.binary
+            && a.live_new_side == b.live_new_side
+    }
+
     pub(crate) fn uses_live_worktree(&self) -> bool {
         self.0.live_new_side
     }
@@ -255,6 +277,14 @@ pub struct ChangedFile {
     pub new_size: Option<u64>,
     /// The exact comparison which produced this row.
     pub identity: FileIdentity,
+}
+
+impl ChangedFile {
+    /// Whether `paths` cover this file or the source it was renamed from.
+    pub fn touched_by<'a>(&self, paths: impl IntoIterator<Item = &'a String> + Clone) -> bool {
+        crate::git::covered(paths.clone(), &self.path)
+            || self.previous_path.as_deref().is_some_and(|p| crate::git::covered(paths, p))
+    }
 }
 
 /// Which side of the diff a comment's lines live on.
