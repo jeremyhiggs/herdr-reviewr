@@ -458,7 +458,7 @@ fn reviewed_but_changed_diff_subdues_only_unchanged_reviewed_blocks() {
     let mut app = app_on(&r);
     assert!(app.set_file_reviewed("a.txt", true));
 
-    r.write("a.txt", "base\nALREADY_SEEN\nmiddle\nLATER_CHANGE\ntail\n");
+    r.write("a.txt", "base\nALREADY_SEEN\nLATER_CHANGE\nmiddle\ntail\n");
     app.reload().unwrap();
 
     let buf = render_buffer(&app);
@@ -470,16 +470,16 @@ fn reviewed_but_changed_diff_subdues_only_unchanged_reviewed_blocks() {
     assert_eq!(
         cell_of(&buf, "LATER_CHANGE").fg,
         app.palette().ink(Ink::Text, Fill::Added),
-        "a later edit keeps the normal diff emphasis",
+        "an adjacent edit keeps the normal diff emphasis",
     );
 
-    r.write("a.txt", "base\nREWRITTEN\nmiddle\nLATER_CHANGE\ntail\n");
+    r.write("a.txt", "base\nREWRITTEN\nLATER_CHANGE\nmiddle\ntail\n");
     app.reload().unwrap();
     let changed = render_buffer(&app);
     assert_eq!(
         cell_of(&changed, "REWRITTEN").fg,
         app.palette().ink(Ink::Text, Fill::Added),
-        "changing any part of a reviewed edit restores the whole block's normal emphasis",
+        "a rewritten reviewed line regains normal emphasis",
     );
 }
 
@@ -515,6 +515,28 @@ fn rendered_markdown_subdues_only_unchanged_reviewed_blocks() {
         cell_of(&render_buffer(&app), "rewritten").fg,
         muted,
         "rewriting a reviewed Markdown block restores normal emphasis",
+    );
+}
+
+#[test]
+fn rendered_untracked_markdown_subdues_every_reviewed_block_except_the_new_one() {
+    let r = Repo::init();
+    r.write("doc.md", "# Head\n\nfirst paragraph\n\n## Tail\n\nlast paragraph\n");
+    let mut app = app_on_rendered(&r);
+    app.focus = Focus::Diff;
+    assert!(app.set_file_reviewed("doc.md", true));
+
+    r.write("doc.md", "# Head\n\nfirst paragraph\n\nnew paragraph\n\n## Tail\n\nlast paragraph\n");
+    app.reload().unwrap();
+
+    let buf = render_buffer(&app);
+    let muted = app.palette().ink(Ink::TextMuted, Fill::Base);
+    assert_eq!(cell_of(&buf, "first paragraph").fg, muted);
+    assert_eq!(cell_of(&buf, "last paragraph").fg, muted);
+    assert_ne!(
+        cell_of(&buf, "new paragraph").fg,
+        muted,
+        "only the paragraph added after review keeps normal emphasis",
     );
 }
 

@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
-use similar::{ChangeTag, TextDiff};
+use similar::{Algorithm, ChangeTag, DiffTag, TextDiff, capture_diff_slices};
 
 use crate::highlight::Highlighter;
 use crate::model::FileIdentity;
@@ -71,11 +71,11 @@ impl DiffLine {
 }
 
 /// A base-anchored replacement retained when its file is marked reviewed.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct ReviewedEdit {
     old_start: u32,
     old_len: u32,
-    new_fingerprint: u64,
+    new_fingerprints: Vec<u64>,
 }
 
 /// One current edit and the rows that paint it.
@@ -436,19 +436,33 @@ impl FileDiff {
         self.edits.iter().map(|edit| edit.reviewed.clone()).collect()
     }
 
-    /// Changed rows whose complete base-anchored edit is unchanged since review.
+    /// Changed rows that remain unchanged within the same base-anchored edit.
     pub(crate) fn reviewed_lines(&self, reviewed: &[ReviewedEdit]) -> HashSet<DiffLine> {
-        let reviewed: HashSet<_> = reviewed.iter().collect();
-        self.edits
-            .iter()
-            .filter(|edit| reviewed.contains(&edit.reviewed))
-            .flat_map(|edit| {
-                edit.old_lines
-                    .clone()
-                    .map(DiffLine::Old)
-                    .chain(edit.new_lines.clone().map(DiffLine::New))
-            })
-            .collect()
+        let reviewed: HashMap<_, _> =
+            reviewed.iter().map(|edit| ((edit.old_start, edit.old_len), edit)).collect();
+        let mut lines = HashSet::new();
+        for edit in &self.edits {
+            let key = (edit.reviewed.old_start, edit.reviewed.old_len);
+            let Some(previous) = reviewed.get(&key) else { continue };
+            lines.extend(edit.old_lines.clone().map(DiffLine::Old));
+            if previous.new_fingerprints == edit.reviewed.new_fingerprints {
+                lines.extend(edit.new_lines.clone().map(DiffLine::New));
+                continue;
+            }
+            for op in capture_diff_slices(
+                Algorithm::Myers,
+                &previous.new_fingerprints,
+                &edit.reviewed.new_fingerprints,
+            ) {
+                if op.tag() == DiffTag::Equal {
+                    lines.extend(
+                        op.new_range()
+                            .map(|offset| DiffLine::New(edit.new_lines.start + offset as u32)),
+                    );
+                }
+            }
+        }
+        lines
     }
 }
 
@@ -462,15 +476,20 @@ fn diff_edits(rows: &[Row], new_lines: &[&str]) -> Vec<DiffEdit> {
                 |line| line - 1,
             );
             let new_start = insertions.clone().find_map(|i| rows[i].new_no()).unwrap_or(0);
-            let mut new_fingerprint = DefaultHasher::new();
-            for line in insertions.clone().filter_map(|i| rows[i].new_no()) {
-                new_lines[line as usize - 1].hash(&mut new_fingerprint);
-            }
+            let new_fingerprints = insertions
+                .clone()
+                .filter_map(|i| rows[i].new_no())
+                .map(|line| {
+                    let mut fingerprint = DefaultHasher::new();
+                    new_lines[line as usize - 1].hash(&mut fingerprint);
+                    fingerprint.finish()
+                })
+                .collect();
             DiffEdit {
                 reviewed: ReviewedEdit {
                     old_start,
                     old_len: deletions.len() as u32,
-                    new_fingerprint: new_fingerprint.finish(),
+                    new_fingerprints,
                 },
                 old_lines: old_start + 1..old_start + 1 + deletions.len() as u32,
                 new_lines: new_start..new_start + insertions.len() as u32,
@@ -864,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn reviewed_edits_match_only_complete_blocks_at_the_same_base_anchor() {
+    fn reviewed_edits_match_unchanged_lines_at_the_same_base_anchor() {
         let base = "base\nmiddle\ntail\n";
         let reviewed = build(base, "base\nseen\nmiddle\ntail\n").reviewed_edits();
         let current = build(base, "base\nseen\nmiddle\nlater\ntail\n");
@@ -906,6 +925,26 @@ mod tests {
         let replacement_lines = after_replacement.reviewed_lines(&replacement);
         assert!(replacement_lines.contains(&DiffLine::Old(2)));
         assert!(replacement_lines.contains(&DiffLine::New(2)));
+
+        let adjacent_reviewed = build(base, "base\nseen\nmiddle\ntail\n").reviewed_edits();
+        let adjacent_current = build(base, "base\nseen\nlater\nmiddle\ntail\n");
+        let adjacent_lines = adjacent_current.reviewed_lines(&adjacent_reviewed);
+        assert!(
+            adjacent_lines.contains(&DiffLine::New(2)),
+            "a reviewed line remains reviewed when the insertion block grows",
+        );
+        assert!(
+            !adjacent_lines.contains(&DiffLine::New(3)),
+            "the adjacent line added later remains new",
+        );
+
+        let whole_file_reviewed = build("", "one\ntwo\nthree\n").reviewed_edits();
+        let whole_file_current = build("", "one\ntwo\nnew\nthree\n");
+        let whole_file_lines = whole_file_current.reviewed_lines(&whole_file_reviewed);
+        assert!(whole_file_lines.contains(&DiffLine::New(1)));
+        assert!(whole_file_lines.contains(&DiffLine::New(2)));
+        assert!(!whole_file_lines.contains(&DiffLine::New(3)));
+        assert!(whole_file_lines.contains(&DiffLine::New(4)));
     }
 
     #[test]
