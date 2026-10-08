@@ -11,7 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   current scope, base, or commit pick. If the file changes later, an orange `!` keeps the earlier
   review visible until `R` accepts the new diff; unchanged reviewed work stays subdued in source
   and rendered Markdown views while adjacent, new, or rewritten lines keep their normal emphasis.
-  Press `R` again to clear it. Review state is session-only and isolated between comparisons.
+  Committing a reviewed new file keeps its review when its branch diff is unchanged. Press `R`
+  again to clear it. Review state is session-only and isolated between comparisons.
   Existing configurations that already bind `R` must move that binding or rebind
   `toggle-reviewed`, because duplicate bindings fail validation.
 

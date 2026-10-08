@@ -138,15 +138,20 @@ pub(crate) struct FileIdentityInput<'a> {
 
 impl FileIdentity {
     pub(crate) fn from_git(input: FileIdentityInput<'_>) -> Self {
+        let old_side_absent = input.old_mode == "000000";
         Self(std::sync::Arc::new(FileIdentityParts {
             old_endpoint: input.old_endpoint.to_string(),
             new_endpoint: input.new_endpoint.to_string(),
-            kind: input.kind,
+            kind: if old_side_absent { ChangeKind::Added } else { input.kind },
             path: input.path.to_string(),
             previous_path: input.previous_path.map(str::to_string),
             old_mode: input.old_mode.to_string(),
             new_mode: input.new_mode.to_string(),
-            old_content: input.old_content.to_string(),
+            old_content: if old_side_absent {
+                "absent".to_string()
+            } else {
+                input.old_content.to_string()
+            },
             new_content: input.new_content.to_string(),
             binary: input.binary,
             live_new_side: input.live_new_side,

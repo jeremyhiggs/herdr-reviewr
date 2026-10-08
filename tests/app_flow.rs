@@ -4729,6 +4729,28 @@ fn reviewed_files_become_changed_without_resurrection() {
     );
 }
 
+#[test]
+fn committing_an_untracked_file_keeps_its_branch_review_when_the_diff_is_unchanged() {
+    let r = Repo::init();
+    r.write("tracked.md", "base\n");
+    r.commit_all("base");
+    r.git(&["checkout", "-q", "-b", "feature"]);
+    r.write("tracked.md", "reviewed markdown\n");
+    r.write("NewTest.t.sol", "contract NewTest {}\n");
+
+    let mut app = App::new(r.path_buf(), Scope::Branch, Some("main".to_string()));
+    app.reload().unwrap();
+    assert!(app.set_file_reviewed("tracked.md", true));
+    assert!(app.set_file_reviewed("NewTest.t.sol", true));
+
+    r.git(&["add", "NewTest.t.sol"]);
+    r.git(&["commit", "-q", "-m", "add test"]);
+    app.reload().unwrap();
+
+    assert_eq!(app.file_review_state("NewTest.t.sol"), FileReviewState::Reviewed);
+    assert_eq!(app.file_review_state("tracked.md"), FileReviewState::Reviewed);
+}
+
 #[cfg(unix)]
 #[test]
 fn a_mode_only_edit_makes_a_reviewed_file_changed() {
