@@ -172,9 +172,9 @@ fn scope_build(input: &WorldInput, head: Option<String>) -> Result<ScopeBuild> {
         Scope::Branch => {
             // A resolve failure fails the build, keeping the stale frame.
             let resolution = git::resolve_base(&input.repo, input.base.as_deref())?;
-            let merge_base = match resolution.status.winner.as_ref() {
-                Some(winner) => git::merge_base_checked(&input.repo, winner.oid())?,
-                None => None,
+            let merge_base = match (head, resolution.status.winner.as_ref()) {
+                (Some(_), Some(winner)) => git::merge_base_checked(&input.repo, winner.oid())?,
+                _ => None,
             };
             let review_context = ReviewContext::Branch {
                 base: resolution.status.winner.as_ref().map(|winner| winner.name().to_string()),

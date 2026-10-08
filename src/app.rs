@@ -1336,7 +1336,18 @@ impl App {
         if self.view_frozen() {
             self.view_reload_held = true;
         } else {
-            let unchanged = open_untouched && self.shown_entry().map(|e| e.path) == open;
+            let shown = self.shown_entry();
+            let unchanged = open_untouched && shown.as_ref().map(|e| &e.path) == open.as_ref();
+            if unchanged
+                && let Some(landed) = shown.and_then(|entry| entry.annotation.map(|f| f.identity))
+                && self
+                    .diff
+                    .identity
+                    .as_ref()
+                    .is_some_and(|loaded| loaded.same_file_comparison(&landed))
+            {
+                self.diff.identity = Some(landed);
+            }
             if !unchanged {
                 self.reload_open_view();
             }

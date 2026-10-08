@@ -4751,6 +4751,38 @@ fn committing_an_untracked_file_keeps_its_branch_review_when_the_diff_is_unchang
     assert_eq!(app.file_review_state("tracked.md"), FileReviewState::Reviewed);
 }
 
+#[test]
+fn an_unchanged_open_file_keeps_its_review_action_after_a_sibling_refresh() {
+    let r = Repo::init();
+    r.write("a.rs", "base a\n");
+    r.write("b.rs", "base b\n");
+    r.commit_all("base");
+    let baseline = herdr_reviewr::git::snapshot_worktree(r.path()).unwrap();
+    r.write("a.rs", "reviewed a\n");
+    r.write("b.rs", "first b\n");
+
+    let mut app = App::new(r.path_buf(), Scope::LastTurn, None);
+    app.sync_turn(herdr_reviewr::turn::TurnReport {
+        last: herdr_reviewr::turn::LastTurn::At(baseline),
+        ..Default::default()
+    });
+    app.reload().unwrap();
+    app.focus = Focus::Diff;
+    app.toggle_current_file_reviewed();
+    assert_eq!(app.current_file_reviewed(), Some(true));
+
+    r.write("b.rs", "second b\n");
+    let mut completion = completion_for(&app, 1);
+    completion.snapshot.as_mut().unwrap().as_mut().unwrap().touched =
+        Some(["b.rs".to_string()].into_iter().collect());
+    assert!(matches!(
+        herdr_reviewr::land_world_completion(&mut app, completion, &live(1)),
+        herdr_reviewr::Landing::Landed
+    ));
+
+    assert_eq!(app.current_file_reviewed(), Some(true));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_mode_only_edit_makes_a_reviewed_file_changed() {
@@ -5534,6 +5566,19 @@ fn outside_a_repo_the_build_yields_the_quiet_empty_snapshot() {
     assert!(snapshot.entries.is_empty(), "no error, no entries — the empty state stays quiet");
     let build = herdr_reviewr::world::build_changed(&app.world_input()).unwrap();
     assert!(build.changeset.files.is_empty());
+}
+
+#[test]
+fn an_unborn_branch_with_a_resolved_base_builds_an_empty_branch_scope() {
+    let r = Repo::init();
+    r.write("seed", "seed\n");
+    r.commit_all("base");
+    r.git(&["checkout", "-q", "--orphan", "feature"]);
+
+    let mut app = App::new(r.path_buf(), Scope::Branch, Some("main".to_string()));
+    app.reload().unwrap();
+
+    assert!(app.entries.is_empty());
 }
 
 #[test]
