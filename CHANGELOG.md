@@ -16,6 +16,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Existing configurations that already bind `R` must move that binding or rebind
   `toggle-reviewed`, because duplicate bindings fail validation.
 
+### Fixed
+- **Unrelated commits preserve reviews.** In Uncommitted scope, committing another file keeps an
+  unchanged file reviewed and preserves subdued highlighting for previously reviewed edits.
+
 ## [0.46.0] — 2026-10-06
 
 ### Changed

@@ -49,8 +49,7 @@ pub struct CommitPick {
     pub newest: String,
 }
 
-/// The semantic namespace for reviewed files. Resolved endpoints stay in each identity, so a
-/// moving ref invalidates files without creating another recoverable context.
+/// The semantic namespace for reviewed files; endpoints certify each loaded snapshot.
 #[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
 pub enum ReviewContext {
     #[default]
@@ -178,8 +177,7 @@ impl FileIdentity {
     /// Whether this file's two sides are unchanged, even if another file moved the snapshot tree.
     pub(crate) fn same_file_comparison(&self, other: &Self) -> bool {
         let (a, b) = (&self.0, &other.0);
-        a.old_endpoint == b.old_endpoint
-            && a.kind == b.kind
+        a.kind == b.kind
             && a.path == b.path
             && a.previous_path == b.previous_path
             && a.old_mode == b.old_mode
@@ -197,8 +195,7 @@ impl FileIdentity {
     /// Whether two comparisons share the same old file and can compare base-anchored edits.
     pub(crate) fn same_old_side(&self, other: &Self) -> bool {
         let (a, b) = (&self.0, &other.0);
-        a.old_endpoint == b.old_endpoint
-            && a.path == b.path
+        a.path == b.path
             && a.previous_path == b.previous_path
             && a.old_mode == b.old_mode
             && a.old_content == b.old_content

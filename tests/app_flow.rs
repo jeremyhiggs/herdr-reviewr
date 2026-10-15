@@ -4730,6 +4730,29 @@ fn reviewed_files_become_changed_without_resurrection() {
 }
 
 #[test]
+fn committing_a_sibling_keeps_an_unchanged_uncommitted_file_reviewed() {
+    let r = Repo::init();
+    r.write("a.rs", "base a\n");
+    r.write("b.rs", "base b\n");
+    r.commit_all("base");
+    r.write("a.rs", "reviewed a\n");
+
+    let mut app = app_on(&r);
+    assert!(app.set_file_reviewed("a.rs", true));
+    r.write("b.rs", "committed b\n");
+    r.git(&["add", "b.rs"]);
+    r.git(&["commit", "-q", "-m", "change sibling"]);
+    app.reload().unwrap();
+
+    assert_eq!(app.file_review_state("a.rs"), FileReviewState::Reviewed);
+    assert_eq!(app.current_file_reviewed(), Some(true));
+
+    r.write("a.rs", "changed after review\n");
+    app.reload().unwrap();
+    assert_eq!(app.file_review_state("a.rs"), FileReviewState::ReviewedButChanged);
+}
+
+#[test]
 fn committing_an_untracked_file_keeps_its_branch_review_when_the_diff_is_unchanged() {
     let r = Repo::init();
     r.write("tracked.md", "base\n");

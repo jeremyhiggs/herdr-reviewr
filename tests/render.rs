@@ -473,6 +473,16 @@ fn reviewed_but_changed_diff_subdues_only_unchanged_reviewed_blocks() {
         "an adjacent edit keeps the normal diff emphasis",
     );
 
+    r.write("b.txt", "committed sibling\n");
+    r.git(&["add", "b.txt"]);
+    r.git(&["commit", "-q", "-m", "add sibling"]);
+    app.reload().unwrap();
+    assert_eq!(
+        cell_of(&render_buffer(&app), "ALREADY_SEEN").fg,
+        app.palette().ink(Ink::TextMuted, Fill::Added),
+        "an unrelated commit preserves reviewed line styling",
+    );
+
     r.write("a.txt", "base\nREWRITTEN\nLATER_CHANGE\nmiddle\ntail\n");
     app.reload().unwrap();
     let changed = render_buffer(&app);
@@ -480,6 +490,17 @@ fn reviewed_but_changed_diff_subdues_only_unchanged_reviewed_blocks() {
         cell_of(&changed, "REWRITTEN").fg,
         app.palette().ink(Ink::Text, Fill::Added),
         "a rewritten reviewed line regains normal emphasis",
+    );
+
+    r.write("a.txt", "base\nmiddle\nchanged tail\n");
+    r.git(&["add", "a.txt"]);
+    r.git(&["commit", "-q", "-m", "change base contents"]);
+    r.write("a.txt", "base\nALREADY_SEEN\nLATER_CHANGE\nmiddle\ntail\n");
+    app.reload().unwrap();
+    assert_ne!(
+        cell_of(&render_buffer(&app), "ALREADY_SEEN").fg,
+        app.palette().ink(Ink::TextMuted, Fill::Added),
+        "changed base contents invalidate reviewed anchors even when an insertion still matches",
     );
 }
 
@@ -507,6 +528,16 @@ fn rendered_markdown_subdues_only_unchanged_reviewed_blocks() {
         cell_of(&buf, "later change").fg,
         muted,
         "a later Markdown block keeps its normal emphasis",
+    );
+
+    r.write("b.txt", "committed sibling\n");
+    r.git(&["add", "b.txt"]);
+    r.git(&["commit", "-q", "-m", "add sibling"]);
+    app.reload().unwrap();
+    assert_eq!(
+        cell_of(&render_buffer(&app), "already seen").fg,
+        muted,
+        "an unrelated commit preserves reviewed Markdown styling",
     );
 
     r.write("doc.md", "# Head\n\nrewritten\n\nmiddle\n\nlater change\n\nend\n");
