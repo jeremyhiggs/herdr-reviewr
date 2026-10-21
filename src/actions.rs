@@ -3,7 +3,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{File, TryLockError};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -157,10 +157,10 @@ fn act(action: Action) -> Result<Option<String>, Stop> {
 /// The review binary's name, which identifies a reviewr pane and names its launch links.
 const BINARY: &str = env!("CARGO_PKG_NAME");
 
-/// How long an action waits for its workspace's lock: a holder's five herdr calls all wedged, its
+/// How long an action waits for its workspace's lock: a holder's six herdr calls all wedged, its
 /// visibility wait, and three seconds of slack, typically enough for its last poll pause and git reads.
 const LOCK_BOUND: Duration = herdr::CALL_BOUND
-    .saturating_mul(5)
+    .saturating_mul(6)
     .saturating_add(VISIBLE_BOUND)
     .saturating_add(Duration::from_secs(3));
 
@@ -216,6 +216,8 @@ struct Target {
     cwd: Option<String>,
     /// The focused pane, whose live cwd a manual open prefers over `cwd`.
     focused: Option<String>,
+    /// The workspace's cwd, the last candidate.
+    workspace_cwd: Option<String>,
 }
 
 impl Target {
@@ -232,6 +234,7 @@ impl Target {
                 cwd: text(&event, "/data/workspace/worktree/checkout_path")
                     .or_else(|| text(&event, "/data/worktree/path")),
                 focused: None,
+                workspace_cwd: None,
             });
         }
         let context: Value = var("HERDR_PLUGIN_CONTEXT_JSON")
@@ -241,8 +244,9 @@ impl Target {
         Ok(Self {
             ws: ws.ok_or_else(no_workspace)?,
             pane,
-            cwd: text(&context, "/focused_pane_cwd").or_else(|| text(&context, "/workspace_cwd")),
+            cwd: text(&context, "/focused_pane_cwd"),
             focused: text(&context, "/focused_pane_id"),
+            workspace_cwd: text(&context, "/workspace_cwd"),
         })
     }
 }
@@ -335,21 +339,50 @@ fn open(
     panes: &PaneList,
 ) -> Result<String, Stop> {
     let ws = target.ws.as_str();
-    // The focused pane's live cwd wins over the launch cwd, when it is inside a repo.
+    // The focused pane's live cwd, its launch cwd, the agent panes', the other panes', the workspace's.
     let live = target
         .focused
         .as_deref()
         .and_then(|focused| panes.pane(focused))
-        .and_then(|entry| entry.foreground_cwd.clone());
-    let cwd = match (&live, &target.cwd) {
-        (Some(live), _) if has_worktree(live) => live,
-        (_, Some(cwd)) if has_worktree(cwd) => cwd,
-        // Name every rejected candidate.
-        _ => {
-            let live = live.map(|live| format!(" (live cwd '{live}')")).unwrap_or_default();
-            let cwd = target.cwd.as_deref().unwrap_or("<no cwd>");
-            return Err(refused(format!("not a git repo: '{cwd}'{live}")));
+        .and_then(|entry| entry.foreground_cwd.as_deref());
+    let mut by_agent: Vec<_> = panes.panes.iter().collect();
+    by_agent.sort_by_key(|entry| entry.agent.is_none());
+    let others = by_agent.into_iter().filter_map(|entry| entry.foreground_cwd.as_deref());
+    // herdr often reports one folder several ways, so each counts once.
+    let mut candidates: Vec<&str> = Vec::new();
+    for dir in live
+        .into_iter()
+        .chain(target.cwd.as_deref())
+        .chain(others)
+        .chain(target.workspace_cwd.as_deref())
+    {
+        if !candidates.contains(&dir) {
+            candidates.push(dir);
         }
+    }
+    // A failed listing skips no checkout: the open still lands, as it did before the filter.
+    let managed: Vec<PathBuf> = herdr::managed_plugin_dirs()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|dir| std::fs::canonicalize(&dir).unwrap_or(dir))
+        .collect();
+    let in_plugin = |dir: &str| {
+        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+        managed.iter().any(|plugin| dir.starts_with(plugin))
+    };
+    let Some(&cwd) = candidates.iter().find(|dir| !in_plugin(dir) && has_worktree(dir)) else {
+        // Name every rejected candidate.
+        if candidates.is_empty() {
+            return Err(refused("no repo to review: no cwd"));
+        }
+        let rejected: Vec<String> = candidates
+            .iter()
+            .map(|dir| {
+                let why = if in_plugin(dir) { "a plugin's checkout" } else { "not a git repo" };
+                format!("'{dir}' ({why})")
+            })
+            .collect();
+        return Err(refused(format!("no repo to review: {}", rejected.join(", "))));
     };
 
     let plugin = herdr::plugin_id();

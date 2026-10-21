@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -222,6 +223,9 @@ pub(crate) struct PaneEntry {
     pub(crate) foreground_cwd: Option<String>,
     #[serde(default, deserialize_with = "non_empty")]
     label: Option<String>,
+    /// The agent herdr detects in the pane; absent for a shell or a plugin pane.
+    #[serde(default, deserialize_with = "non_empty")]
+    pub(crate) agent: Option<String>,
 }
 
 impl PaneList {
@@ -234,6 +238,26 @@ impl PaneList {
     pub(crate) fn pane(&self, pane: &str) -> Option<&PaneEntry> {
         self.panes.iter().find(|entry| entry.pane_id == pane)
     }
+}
+
+/// The checkouts herdr manages for its installed plugins; a linked plugin's folder is the user's.
+pub(crate) fn managed_plugin_dirs() -> Result<Vec<PathBuf>, HerdrError> {
+    #[derive(Deserialize)]
+    struct Plugins {
+        plugins: Vec<Plugin>,
+    }
+    #[derive(Deserialize)]
+    struct Plugin {
+        #[serde(default)]
+        source: Option<Source>,
+    }
+    #[derive(Deserialize)]
+    struct Source {
+        #[serde(default)]
+        managed_path: Option<PathBuf>,
+    }
+    let list: Plugins = answer(&call(&["plugin", "list", "--json"])?)?;
+    Ok(list.plugins.into_iter().filter_map(|plugin| plugin.source?.managed_path).collect())
 }
 
 /// The processes herdr reports in a pane's foreground: the group on unix, one process on Windows.

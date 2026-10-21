@@ -137,8 +137,16 @@ On macOS and Linux reviewr prepends the common host bin dirs when it resolves `g
 (`src/proc.rs`), so a stripped `PATH` cannot hide them. Windows has no such dirs to trust.
 
 - **Action context** (`HERDR_PLUGIN_CONTEXT_JSON`): `workspace_id`, `tab_id`, `focused_pane_id`,
-  `focused_pane_cwd`, `worktree:{repo_root, checkout_path, ...}`. The open action places a
-  manual open from the focused pane's cwd, else `workspace_cwd`. The review UI reads none of it.
+  `focused_pane_cwd`, `worktree:{repo_root, checkout_path, ...}`. The open action reviews the
+  first repo among the focused pane's live cwd, its `focused_pane_cwd`, the agent panes' cwds, the
+  other panes' cwds, and `workspace_cwd`, skipping any inside a managed plugin checkout. The review
+  UI reads none of it. `workspace_cwd` is the focused pane's folder too (observed, 0.9.3), so a
+  focused plugin pane leaves only the other panes to fall back on.
+- **A plugin pane starts in the focused pane's folder** on a local herdr 0.9.3, even when the
+  `plugin pane open` caller runs from the plugin's root (observed with herdr-file-viewer).
+- **`herdr plugin list --json`** gives each plugin's `plugin_root` and, for a GitHub install,
+  `source.managed_path`: herdr's own checkout at a pinned commit, a detached HEAD (observed, 0.9.3).
+  A linked plugin has no `managed_path`, and its root is the developer's checkout.
 - **`focused_pane_cwd` is the pane's *launch* cwd, not its live one** (observed, 0.7.5: a pane
   running `claude -w <worktree>` reported the main checkout it was launched from, while the
   agent process had chdir'd into the worktree). `herdr pane get <id>` carries both: `.result.pane.cwd`

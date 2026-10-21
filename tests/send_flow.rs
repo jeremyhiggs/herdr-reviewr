@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use common::{Repo, app_on, fake_herdr, herdr_calls, herdr_error};
+use common::{Repo, UnifiedRow as _, app_on, fake_herdr, herdr_calls, herdr_error};
 use herdr_reviewr::app::{App, Focus, Mode};
 use herdr_reviewr::keymap::Keymap;
 use herdr_reviewr::ui;

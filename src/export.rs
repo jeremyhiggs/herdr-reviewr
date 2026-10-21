@@ -20,11 +20,18 @@ fn normalize_text(text: &str) -> String {
         .join("\n")
 }
 
-/// Many comments, sorted by file then start line, one blank line between blocks.
-pub fn format_all(comments: &[&Comment]) -> String {
+/// The exported review: the trimmed prefix, then comments by file and start line, a blank line between.
+pub fn format_review(prefix: Option<&str>, comments: &[&Comment]) -> String {
     let mut sorted = comments.to_vec();
     sorted.sort_by(|a, b| a.file.cmp(&b.file).then(a.start.cmp(&b.start)));
-    sorted.iter().map(|c| format_comment(c)).collect::<Vec<_>>().join("\n\n")
+    let prefix = prefix
+        .map(|text| text.replace('\r', "").trim_end().to_owned())
+        .filter(|text| !text.is_empty());
+    prefix
+        .into_iter()
+        .chain(sorted.iter().map(|c| format_comment(c)))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// A destination comments can be exported to. Export succeeds or errors as a whole.
@@ -198,7 +205,7 @@ impl ExportTarget for Agent {
 
 #[cfg(test)]
 mod tests {
-    use super::{Agent, Clipboard, ExportTarget, format_all, format_comment, send_failure};
+    use super::{Agent, Clipboard, ExportTarget, format_comment, format_review, send_failure};
     use crate::model::{Comment, Side};
 
     #[cfg(not(windows))]
@@ -321,7 +328,18 @@ mod tests {
         let b = comment("b.rs", Side::New, 5, 5, "+x", "two");
         let a2 = comment("a.rs", Side::New, 20, 20, "+y", "later");
         let a1 = comment("a.rs", Side::New, 3, 3, "+z", "earlier");
-        let out = format_all(&[&b, &a2, &a1]);
+        let out = format_review(None, &[&b, &a2, &a1]);
         assert_eq!(out, "a.rs:3\n+z\nearlier\n\na.rs:20\n+y\nlater\n\nb.rs:5\n+x\ntwo");
+    }
+
+    #[test]
+    fn the_prefix_heads_the_review_with_its_blank_lines_but_not_its_trailing_space() {
+        let a = comment("a.rs", Side::New, 3, 3, "+z", "rename");
+        assert_eq!(
+            format_review(Some("/fix {all}\r\n\n  then test \n\n"), &[&a]),
+            "/fix {all}\n\n  then test\n\na.rs:3\n+z\nrename"
+        );
+        assert_eq!(format_review(None, &[&a]), "a.rs:3\n+z\nrename");
+        assert_eq!(format_review(Some(" \r\n"), &[&a]), "a.rs:3\n+z\nrename");
     }
 }

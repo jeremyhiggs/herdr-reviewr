@@ -243,8 +243,37 @@ pub fn land_world(app: &mut App) {
 
 /// A pane over `repo` whose config sets `markdown_view = "rendered"`: markdown opens rendered.
 pub fn app_on_rendered(repo: &Repo) -> App {
+    app_on_config(repo, "markdown_view = \"rendered\"\n")
+}
+
+/// A pane over `repo` whose config sets `diff_view = "split"`: a wide diff opens split.
+pub fn app_on_split(repo: &Repo) -> App {
+    app_on_config(repo, "diff_view = \"split\"\n")
+}
+
+/// A unified row's content, for tests that read unified rows; panics on a split pair.
+pub trait UnifiedRow {
+    fn unified(&self) -> &herdr_reviewr::diff::Row;
+
+    fn text(&self) -> String {
+        self.unified().text()
+    }
+
+    fn marker(&self) -> char {
+        self.unified().marker()
+    }
+}
+
+impl UnifiedRow for herdr_reviewr::split::Visible {
+    fn unified(&self) -> &herdr_reviewr::diff::Row {
+        self.row().expect("a unified row")
+    }
+}
+
+/// A fresh pane over `repo`, seeded from a config file holding `toml`.
+pub fn app_on_config(repo: &Repo, toml: &str) -> App {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("config.toml"), "markdown_view = \"rendered\"\n").unwrap();
+    std::fs::write(dir.path().join("config.toml"), toml).unwrap();
     let config = herdr_reviewr::config::plugin_config_in(dir.path()).unwrap();
     let mut app = App::new(repo.path_buf(), Scope::Uncommitted, None);
     app.seed_from_config(&config);

@@ -20,6 +20,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Unrelated commits preserve reviews.** In Uncommitted scope, committing another file keeps an
   unchanged file reviewed and preserves subdued highlighting for previously reviewed edits.
 
+## [0.48.0] — 2026-10-19
+
+### Added
+- **Review prefix**: `review_prefix` puts your own text above the comments on every send and copy.
+  Thanks [@macintacos](https://github.com/macintacos) ([#129](https://github.com/persiyanov/herdr-reviewr/issues/129)).
+
+## [0.47.0] — 2026-10-19
+
+### Added
+- **Split view**: `|` shows the diff side by side, and comments, find and copy work on both halves. `diff_view = "split"` starts a fresh pane in split.
+  Thanks [@Tarektouati](https://github.com/Tarektouati) ([#116](https://github.com/persiyanov/herdr-reviewr/issues/116)).
+- **Breaking: `|` is a new default key.** A `[keybindings]` config that already uses `|` now collides and must move it.
+
+## [0.46.2] — 2026-10-18
+
+### Fixed
+- **Toggle from a plugin's pane**: opening from a pane inside another plugin's checkout, like herdr-file-viewer, now reviews the agent's repo, else another pane's, not that checkout.
+  Thanks [@Branpolo](https://github.com/Branpolo) ([#130](https://github.com/persiyanov/herdr-reviewr/issues/130)).
+
+## [0.46.1] — 2026-10-18
+
+### Fixed
+- **Windows install from PowerShell 7**: installing no longer fails at "verifying checksum" when herdr was started from pwsh 7.
+  Thanks [@v-senninha-v](https://github.com/v-senninha-v) ([#127](https://github.com/persiyanov/herdr-reviewr/issues/127)) and [@Yivas](https://github.com/Yivas) ([#142](https://github.com/persiyanov/herdr-reviewr/issues/142)).
+
 ## [0.46.0] — 2026-10-06
 
 ### Changed

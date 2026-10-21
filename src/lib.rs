@@ -29,6 +29,7 @@ pub mod schedule;
 pub mod search;
 pub mod selection;
 pub mod snippet;
+pub mod split;
 #[cfg(test)]
 mod test_support;
 mod text;
@@ -63,7 +64,7 @@ use crate::app::{App, Focus, Mode};
 use crate::config::{Config, PluginConfig};
 use crate::export::Clipboard;
 use crate::keymap::Keymap;
-use crate::model::Scope;
+use crate::model::{Scope, Side};
 
 /// Entry point: parse config, set up the terminal, run the loop, restore.
 pub fn run() -> Result<()> {
@@ -968,6 +969,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, cfg: &Config) -> Re
             };
             // Rewrap rendered markdown before the heights measure it.
             app.sync_rendered_width(ui::rendered_width(area, app));
+            app.sync_split_width(ui::diff_inner_width(area, app));
             let heights = ui::diff_row_heights(app, area);
             app.settle_diff_scroll(&heights, effective);
             let file_vp = ui::file_viewport_height(area, app);
@@ -1656,7 +1658,7 @@ fn apply_text_edit(app: &mut App, code: KeyCode, ctrl: bool, alt: bool, word: bo
 /// Map one key press onto `App` through the painted frame's `keymap`.
 pub fn handle_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Result<()> {
     let done = dispatch_key(app, key, area, keymap);
-    app.settle_pick();
+    app.settle_input();
     done
 }
 
@@ -1916,6 +1918,7 @@ fn dispatch_key(app: &mut App, key: KeyEvent, area: Rect, keymap: &Keymap) -> Re
             K::PrevFile => app.prev_file(),
             K::Wrap => app.toggle_wrap(),
             K::Rendered => app.toggle_rendered(),
+            K::Split => app.toggle_split(),
             K::NavigatorPosition => app.cycle_navigator_position(),
             K::NavigatorHide => app.toggle_navigator_hidden(),
             K::NavigatorGrow => app.resize_navigator(4),
@@ -1976,8 +1979,8 @@ fn handle_text_down(app: &mut App, m: MouseEvent, area: Rect) -> bool {
         app.gesture =
             Gesture::Text { drag: TextDrag { surface, anchor: point, extent: point }, count };
     };
-    if file_tab && let Some(point) = ui::read_point_at(area, app, m.column, m.row) {
-        arm(app, Surface::Read, point);
+    if file_tab && let Some((side, point)) = ui::read_point_at(area, app, m.column, m.row) {
+        arm(app, Surface::Read { side }, point);
         return true;
     }
     if file_tab && let Some((comment, point)) = ui::card_point_at(area, app, m.column, m.row) {
@@ -2030,9 +2033,12 @@ fn text_drag_edge_scroll(app: &mut App, m: MouseEvent, area: Rect) {
     use crate::selection::Surface;
     let Some(drag) = app.text_drag() else { return };
     match drag.surface {
-        Surface::Read => read_edge_scroll(app, m, area, true),
+        Surface::Read { side } => {
+            read_edge_scroll(app, m, area);
+            read_edge_scroll_sideways(app, m, area, side);
+        }
         // Card text ignores h-scroll (TS-ONE-SURFACE).
-        Surface::Card { .. } => read_edge_scroll(app, m, area, false),
+        Surface::Card { .. } => read_edge_scroll(app, m, area),
         Surface::Files => {
             let inner = ui::files_inner_rect(area, app);
             let delta = edge_delta(m.row, inner);
@@ -2063,7 +2069,7 @@ fn text_drag_set_extent(app: &mut App, m: MouseEvent, area: Rect) {
     use crate::selection::{Point, Surface};
     let Some(drag) = app.text_drag() else { return };
     let extent = match drag.surface {
-        Surface::Read => ui::read_point_clamped(area, app, m.column, m.row),
+        Surface::Read { side } => ui::read_point_clamped(area, app, side, m.column, m.row),
         Surface::Card { comment } => ui::card_point_clamped(area, app, comment, m.column, m.row),
         Surface::Painted => ui::painted_point(area, app, m.column, m.row, true),
         Surface::Files => {
@@ -2086,8 +2092,8 @@ fn text_drag_set_extent(app: &mut App, m: MouseEvent, area: Rect) {
     }
 }
 
-/// Scroll the read pane while a drag is past its content, and sideways when `horizontal`.
-fn read_edge_scroll(app: &mut App, m: MouseEvent, area: Rect, horizontal: bool) {
+/// Scroll the read pane while a drag is past its content rows.
+fn read_edge_scroll(app: &mut App, m: MouseEvent, area: Rect) {
     let content = ui::read_content_rect(area, app);
     if content.height == 0 {
         return;
@@ -2098,16 +2104,22 @@ fn read_edge_scroll(app: &mut App, m: MouseEvent, area: Rect, horizontal: bool) 
         // The same event's extent update maps against the post-scroll layout.
         ui::refresh_read_layout(app, area);
     }
+}
+
+/// Scroll the read pane sideways while a text drag is past its column on `side`.
+fn read_edge_scroll_sideways(app: &mut App, m: MouseEvent, area: Rect, side: Option<Side>) {
     // Rendered markdown never scrolls sideways, so its drag leaves the source's offset alone.
-    if horizontal && !app.wrap && !app.rendered_active() {
-        if m.column < content.x {
-            app.h_scroll = app.h_scroll.saturating_sub(2);
-        } else if m.column >= content.x + content.width {
-            // Capped at the widest row, never pulled back from a keyboard scroll past it.
-            let cap = ui::widest_visible_row(app, area).saturating_sub(1);
-            if app.h_scroll < cap {
-                app.h_scroll = (app.h_scroll + 2).min(cap);
-            }
+    if app.wrap || app.rendered_active() {
+        return;
+    }
+    let (left, right) = ui::read_drag_columns(area, app, side);
+    if m.column < left {
+        app.h_scroll = app.h_scroll.saturating_sub(2);
+    } else if m.column >= right {
+        // Capped at the widest row, never pulled back from a keyboard scroll past it.
+        let cap = ui::widest_visible_row(app, area).saturating_sub(1);
+        if app.h_scroll < cap {
+            app.h_scroll = (app.h_scroll + 2).min(cap);
         }
     }
 }
@@ -2137,13 +2149,13 @@ fn finish_text_drag(
                 }
             }
             // A double copies the word; a wordless cell clicks.
-            Surface::Read | Surface::Painted | Surface::Card { .. } if count == 2 => {
+            Surface::Read { .. } | Surface::Painted | Surface::Card { .. } if count == 2 => {
                 if !word_click_copy(app, area, drag, target) && clicks_act {
                     perform_click(app, m, area, heights, drag)?;
                 }
             }
             // A triple copies the source line; an empty line clicks.
-            Surface::Read | Surface::Painted | Surface::Card { .. } if count >= 3 => {
+            Surface::Read { .. } | Surface::Painted | Surface::Card { .. } if count >= 3 => {
                 if !line_click_copy(app, area, drag, target) && clicks_act {
                     perform_click(app, m, area, heights, drag)?;
                 }
@@ -2266,7 +2278,7 @@ fn surface_text(
 ) -> Option<String> {
     use crate::selection::{Surface, lines_text};
     match surface {
-        Surface::Read => Some(crate::selection::read_text(&app.visible, a, b)),
+        Surface::Read { side } => Some(crate::selection::read_text(&app.visible, side, a, b)),
         Surface::Files => {
             Some(crate::selection::files_text(&app.file_rows, &app.entries, a.row, b.row))
         }
@@ -2304,7 +2316,7 @@ fn perform_click(
                 app.pr_select(i);
             }
         }
-        Surface::Read | Surface::Painted | Surface::Card { .. } => {
+        Surface::Read { .. } | Surface::Painted | Surface::Card { .. } => {
             if let Some(url) = app.painted_link_at(m.column, m.row) {
                 app.focus = Focus::Diff;
                 app.open_link(&url);
@@ -2343,7 +2355,7 @@ pub fn handle_mouse(
     target: &dyn crate::export::ExportTarget,
 ) -> Result<()> {
     let done = dispatch_mouse(app, m, area, heights, keymap, target);
-    app.settle_pick();
+    app.settle_input();
     done
 }
 
@@ -2567,7 +2579,7 @@ fn dispatch_mouse(
             } else if let Some(i) =
                 ui::hit_diff(area, app, m.column, m.row, heights, app.diff_scroll)
             {
-                // Only non-text display lines reach here: a fold or a comment card's line.
+                // Only lines with no text under the pointer reach here: a fold, a card, a blank half.
                 app.focus = Focus::Diff;
                 app.diff_cursor = i;
                 app.select_anchor = None;
@@ -2580,8 +2592,8 @@ fn dispatch_mouse(
         }
         MouseEventKind::Drag(MouseButton::Left) if app.gutter_drag() => {
             // A gutter drag selects rows, so it never scrolls horizontally.
-            read_edge_scroll(app, m, area, false);
-            if let Some(p) = ui::read_point_clamped(area, app, m.column, m.row) {
+            read_edge_scroll(app, m, area);
+            if let Some(p) = ui::read_point_clamped(area, app, None, m.column, m.row) {
                 app.drag_select_to(p.row);
             }
         }
@@ -2609,7 +2621,7 @@ fn dispatch_mouse(
                 ui::refresh_read_layout(app, area);
             }
             if app.gutter_drag() {
-                if let Some(p) = ui::read_point_clamped(area, app, m.column, m.row) {
+                if let Some(p) = ui::read_point_clamped(area, app, None, m.column, m.row) {
                     app.drag_select_to(p.row);
                 }
             } else {
@@ -2732,7 +2744,7 @@ mod refresh_tests {
         use crate::selection::{Gesture, Point, Surface, TextDrag};
         let mut app = App::new(std::path::PathBuf::from("."), Scope::Uncommitted, None);
         let drag = TextDrag {
-            surface: Surface::Read,
+            surface: Surface::Read { side: None },
             anchor: Point { row: 0, chr: 0 },
             extent: Point { row: 0, chr: 4 },
         };
@@ -3510,7 +3522,7 @@ mod refresh_tests {
         // A pristine press, so the completion copies nothing and no clipboard runs.
         let press = Gesture::Text {
             drag: TextDrag {
-                surface: Surface::Read,
+                surface: Surface::Read { side: None },
                 anchor: Point { row: 0, chr: 0 },
                 extent: Point { row: 0, chr: 0 },
             },

@@ -60,10 +60,11 @@ impl Config {
     }
 }
 
-const PLUGIN_CONFIG_KEYS: [&str; 13] = [
+const PLUGIN_CONFIG_KEYS: [&str; 15] = [
     "theme",
     "default_scope",
     "markdown_view",
+    "diff_view",
     "navigator_position",
     "toggle_placement",
     "toggle_direction",
@@ -73,6 +74,7 @@ const PLUGIN_CONFIG_KEYS: [&str; 13] = [
     "azure_devops_host",
     "editor",
     "url_opener",
+    "review_prefix",
     "keybindings",
 ];
 
@@ -82,6 +84,14 @@ pub enum MarkdownView {
     #[default]
     Source,
     Rendered,
+}
+
+/// How a fresh pane shows a diff: one column, or old and new side by side.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DiffView {
+    #[default]
+    Unified,
+    Split,
 }
 
 /// Where the navigator sits around the read pane.
@@ -164,6 +174,7 @@ pub struct PluginConfig {
     theme: String,
     default_scope: crate::model::Scope,
     markdown_view: MarkdownView,
+    diff_view: DiffView,
     navigator_position: NavigatorPosition,
     toggle_placement: TogglePlacement,
     toggle_direction: ToggleDirection,
@@ -173,6 +184,7 @@ pub struct PluginConfig {
     azure_devops_host: Option<String>,
     editor: Option<String>,
     url_opener: Option<String>,
+    review_prefix: Option<String>,
     keymap: crate::keymap::Keymap,
 }
 
@@ -182,6 +194,7 @@ impl Default for PluginConfig {
             theme: crate::theme::DEFAULT.to_owned(),
             default_scope: crate::model::Scope::Uncommitted,
             markdown_view: MarkdownView::Source,
+            diff_view: DiffView::Unified,
             navigator_position: NavigatorPosition::Right,
             toggle_placement: TogglePlacement::Split,
             toggle_direction: ToggleDirection::Right,
@@ -191,6 +204,7 @@ impl Default for PluginConfig {
             azure_devops_host: None,
             editor: None,
             url_opener: None,
+            review_prefix: None,
             keymap: crate::keymap::Keymap::default(),
         }
     }
@@ -209,6 +223,11 @@ impl PluginConfig {
     /// How a fresh pane shows markdown; only `m` flips a running one.
     pub fn markdown_view(&self) -> MarkdownView {
         self.markdown_view
+    }
+
+    /// How a fresh pane shows a diff; only `|` flips a running one.
+    pub fn diff_view(&self) -> DiffView {
+        self.diff_view
     }
 
     pub fn navigator_position(&self) -> NavigatorPosition {
@@ -255,6 +274,11 @@ impl PluginConfig {
 
     pub fn url_opener(&self) -> Option<&str> {
         self.url_opener.as_deref()
+    }
+
+    /// Text that heads every exported review, as written.
+    pub fn review_prefix(&self) -> Option<&str> {
+        self.review_prefix.as_deref()
     }
 
     /// The resolved keymap: the defaults with this snapshot's `[keybindings]` applied.
@@ -369,6 +393,13 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
                 }
             };
     }
+    if let Some(value) = table.get("diff_view") {
+        config.diff_view = match string_value(path, "diff_view", value, "one of unified, split")? {
+            "unified" => DiffView::Unified,
+            "split" => DiffView::Split,
+            _ => return Err(value_error(path, value, "diff_view", "one of unified, split")),
+        };
+    }
     if let Some(value) = table.get("navigator_position") {
         config.navigator_position = match string_value(
             path,
@@ -464,6 +495,13 @@ fn parse_plugin_config(path: &Path) -> Result<PluginConfig, PluginConfigError> {
             ));
         }
         config.url_opener = Some(command.to_owned());
+    }
+    if let Some(value) = table.get("review_prefix") {
+        let prefix = value
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .ok_or_else(|| value_error(path, value, "review_prefix", "non-empty text"))?;
+        config.review_prefix = Some(prefix.to_owned());
     }
     // One hostname per forge; the later key's error names the earlier owner.
     let host_keys = [
@@ -668,7 +706,8 @@ pub(crate) fn plugin_config_from_herdr() -> Result<PluginConfig, PluginConfigErr
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, MarkdownView, NavigatorPosition, PluginConfig, ToggleDirection, TogglePlacement,
+        Config, DiffView, MarkdownView, NavigatorPosition, PluginConfig, ToggleDirection,
+        TogglePlacement,
     };
     use crate::keymap::KeyCode;
     use crate::model::Scope;
@@ -742,6 +781,7 @@ mod tests {
         assert_eq!(config.github_host(), None);
         assert_eq!(config.url_opener(), None);
         assert_eq!(config.markdown_view(), MarkdownView::Source);
+        assert_eq!(config.diff_view(), DiffView::Unified);
     }
 
     #[test]
@@ -758,11 +798,13 @@ mod tests {
                 "auto_open = false\n",
                 "github_host = \"GitHub.Example.COM\"\n",
                 "markdown_view = \"rendered\"\n",
+                "diff_view = \"split\"\n",
             ),
         )
         .unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.markdown_view(), MarkdownView::Rendered);
+        assert_eq!(config.diff_view(), DiffView::Split);
         assert_eq!(config.theme(), "tokyo-night");
         assert_eq!(config.default_scope(), Scope::LastTurn);
         assert_eq!(config.navigator_position(), NavigatorPosition::Bottom);
@@ -791,6 +833,19 @@ mod tests {
         std::fs::write(&path, "theme = \"tokyo-night\"\n").unwrap();
         let config = super::plugin_config_in(dir.path()).unwrap();
         assert_eq!(config.editor(), None);
+    }
+
+    #[test]
+    fn the_review_prefix_reaches_the_resolved_config_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "review_prefix = \"\"\"\n/fix {all} of these\n\n  then test\n\"\"\"\n",
+        )
+        .unwrap();
+        let config = super::plugin_config_in(dir.path()).unwrap();
+        assert_eq!(config.review_prefix(), Some("/fix {all} of these\n\n  then test\n"));
     }
 
     #[test]
@@ -832,6 +887,7 @@ mod tests {
             ("default_scope = \"commits\"\n", "`default_scope`"),
             ("markdown_view = \"preview\"\n", "`markdown_view`"),
             ("markdown_view = true\n", "`markdown_view`"),
+            ("diff_view = \"side-by-side\"\n", "`diff_view`"),
             ("navigator_position = \"center\"\n", "`navigator_position`"),
             ("toggle_placement = \"left\"\n", "`toggle_placement`"),
             ("toggle_direction = \"left\"\n", "`toggle_direction`"),
@@ -850,6 +906,9 @@ mod tests {
             ("url_opener = \"bridge {ur}\"\n", "`{ur}`"),
             ("url_opener = \"''\"\n", "`url_opener`"),
             ("url_opener = \"{url} --new\"\n", "`url_opener`"),
+            ("review_prefix = \"\"\n", "`review_prefix`"),
+            ("review_prefix = \"\"\"\n  \n\"\"\"\n", "`review_prefix`"),
+            ("review_prefix = 42\n", "`review_prefix`"),
             ("github_host = \"github.com\"\n", "`github_host`"),
             ("github_host = \"gitlab.com\"\n", "`github_host`"),
             ("gitlab_host = \"gitlab.com\"\n", "`gitlab_host`"),

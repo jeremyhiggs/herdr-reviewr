@@ -271,9 +271,8 @@ fn a_batch_rereads_the_open_file_only_when_it_names_it() {
     r.write("b.txt", "bb\n");
     let mut app = common::app_on(&r);
     assert_eq!(app.diff_path.as_deref(), Some("a.txt"), "the first changed file is open");
-    let text = |app: &App| {
-        app.visible.iter().map(herdr_reviewr::diff::Row::text).collect::<Vec<_>>().join("\n")
-    };
+    let text =
+        |app: &App| app.visible.iter().map(common::UnifiedRow::text).collect::<Vec<_>>().join("\n");
     assert!(text(&app).contains("two"));
 
     r.write("a.txt", "three\n");
