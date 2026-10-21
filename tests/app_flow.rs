@@ -7984,6 +7984,29 @@ fn pointer_motion_with_no_button_completes_a_drag_whose_release_was_lost() {
 }
 
 #[test]
+fn a_new_mouse_down_ignores_rows_removed_during_a_held_refresh() {
+    for gutter in [false, true] {
+        let r = selection_repo();
+        let mut app = app_on(&r);
+        let (c0, r0) = sel_cell(&app, 0, 0);
+        let (c1, r1) = sel_cell(&app, 1, 2);
+        sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), c0, r0);
+        sel_mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), c1, r1);
+        r.write("m.rs", "short\n");
+        app.reload().unwrap();
+        assert_eq!(app.visible.len(), 3, "the live gesture holds the old view");
+
+        let inner = herdr_reviewr::ui::read_inner_rect(SEL_AREA, &app);
+        let col = inner.x + if gutter { 1 } else { 6 };
+        sel_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), col, inner.y + 2);
+        assert_eq!(last_copy().as_deref(), Some("alpha beta\n\t"));
+        assert_eq!(app.visible.len(), 1, "the lost release lands the shorter view");
+        assert!(herdr_reviewr::ui::read_point_at(SEL_AREA, &app, col, inner.y + 2).is_none());
+        assert!(herdr_reviewr::ui::gutter_row_at(SEL_AREA, &app, col, inner.y + 2).is_none());
+    }
+}
+
+#[test]
 fn the_next_mouse_down_completes_the_old_gesture_then_arms_its_own() {
     let r = selection_repo();
     let mut app = app_on(&r);

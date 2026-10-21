@@ -551,7 +551,7 @@ pub fn read_point_at(
     let Slot::Code { row: li, seg } = *slots.get((row - pane.inner.y) as usize)? else {
         return None;
     };
-    let side = match &app.visible[li] {
+    let side = match app.visible.get(li)? {
         Visible::Pair(p) => {
             Some(side_at(&pane, col).filter(|&s| paints_on(app, &pane, p, seg, s))?)
         }
@@ -616,7 +616,7 @@ pub fn gutter_row_at(area: Rect, app: &App, col: u16, row: u16) -> Option<usize>
         return None;
     };
     let in_gutter = |x0: usize| (x0..x0 + pane.prefix_w).contains(&(col as usize));
-    let hit = match &app.visible[li] {
+    let hit = match app.visible.get(li)? {
         Visible::Pair(p) => [Side::Old, Side::New].into_iter().any(|side| {
             paints_on(app, &pane, p, seg, side) && in_gutter(column(&pane, Some(side)).0)
         }),
